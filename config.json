@@ -4,7 +4,7 @@
     "priority_exchange": "bingx"
   },
   "trading": {
-    "usdt_margin_per_trade": 2,
+    "usdt_margin_per_trade": 2.5,
     "default_leverage": 10,
     "trailing_stop_percent": 2.0,
     "trailing_stop_distance": 1.0,

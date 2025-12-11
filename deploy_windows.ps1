@@ -1,254 +1,175 @@
-# windows.ps1 - Script optimizado para trading bot
+# deploy_windows.ps1 - Script de implementacion
 param(
+    [switch]$ScheduleTask,
     [switch]$InstallService,
-    [switch]$UninstallService,
-    [switch]$StartService,
-    [switch]$StopService,
-    [switch]$CheckStatus
+    [switch]$QuickStart
 )
 
-# Configuración
-$ScriptDirectory = $PSScriptRoot
-$ServiceName = "TradingBotService"
-$PythonExe = "python.exe"
-$MainScript = "main.py"
-$LogDir = Join-Path $ScriptDirectory "logs"
-$LogFile = Join-Path $LogDir "trading_bot_$(Get-Date -Format 'yyyyMMdd').log"
-$PIDFile = Join-Path $ScriptDirectory "trading_bot.pid"
+$ScriptDir = $PSScriptRoot
+$BotDir = $ScriptDir
+$TaskName = "TradingBot"
+$TaskDescription = "Ejecuta bot de trading automaticamente al inicio"
 
-# Crear directorio de logs si no existe
-if (-not (Test-Path $LogDir)) {
-    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+Write-Host "=== DEPLOY TRADING BOT ===" -ForegroundColor Cyan
+Write-Host "Directorio: $BotDir" -ForegroundColor Yellow
+
+# Verificar requisitos
+Write-Host ""
+Write-Host "Verificando requisitos..." -ForegroundColor Cyan
+
+# 1. Verificar Python
+try {
+    $pythonVersion = python --version 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Python encontrado: $pythonVersion" -ForegroundColor Green
+    } else {
+        Write-Host "Python no encontrado. Instala Python 3.8+ primero." -ForegroundColor Red
+        exit 1
+    }
+} catch {
+    Write-Host "Python no encontrado. Instala Python 3.8+ primero." -ForegroundColor Red
+    exit 1
 }
 
-# Función para escribir logs
-function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $LogMessage = "[$Timestamp] [$Level] $Message"
-    Add-Content -Path $LogFile -Value $LogMessage -Encoding UTF8
-    Write-Host $LogMessage
+# 2. Verificar dependencias
+Write-Host ""
+Write-Host "Instalando/verificando dependencias..." -ForegroundColor Cyan
+Set-Location $BotDir
+
+# Instalar pip si no existe
+try {
+    python -m pip --version 2>&1 | Out-Null
+} catch {
+    Write-Host "Instalando pip..." -ForegroundColor Yellow
+    python -m ensurepip --upgrade
 }
 
-# Función para verificar si el bot ya está corriendo
-function Test-BotRunning {
-    $pid = $null
-    if (Test-Path $PIDFile) {
-        $pid = Get-Content $PIDFile -ErrorAction SilentlyContinue
-    }
-
-    if ($pid) {
-        try {
-            $process = Get-Process -Id $pid -ErrorAction SilentlyContinue
-            if ($process -and $process.ProcessName -like "*python*") {
-                $cmdLine = (Get-WmiObject Win32_Process -Filter "ProcessId = $pid").CommandLine
-                if ($cmdLine -like "*$MainScript*") {
-                    return $true, $pid
-                }
-            }
-        } catch {
-            # PID inválido
-        }
-    }
-
-    # Buscar por línea de comandos
-    $processes = Get-WmiObject Win32_Process | Where-Object {
-        $_.CommandLine -like "*$MainScript*" -and $_.Name -like "*python*"
-    }
-
-    if ($processes) {
-        $pid = $processes[0].ProcessId
-        $pid | Out-File -FilePath $PIDFile -Encoding UTF8
-        return $true, $pid
-    }
-
-    return $false, $null
+# Instalar dependencias
+$requirementsFile = Join-Path $BotDir "requirements.txt"
+if (Test-Path $requirementsFile) {
+    Write-Host "Instalando desde requirements.txt..." -ForegroundColor Yellow
+    python -m pip install -r requirements.txt
+} else {
+    # Crear requirements.txt si no existe
+    $requirements = @"
+python-telegram-bot==20.3
+python-dotenv==1.0.0
+requests==2.31.0
+hmac==0.0.0
+"@
+    $requirements | Out-File -FilePath $requirementsFile -Encoding UTF8
+    Write-Host "requirements.txt creado" -ForegroundColor Green
+    python -m pip install -r requirements.txt
 }
 
-# Función para instalar como servicio con NSSM
-function Install-TradingService {
-    Write-Log "Instalando servicio $ServiceName..."
+# 3. Verificar archivos de configuracion
+Write-Host ""
+Write-Host "Verificando configuracion..." -ForegroundColor Cyan
 
-    # Verificar NSSM
-    $nssmPath = Join-Path $ScriptDirectory "nssm.exe"
-    if (-not (Test-Path $nssmPath)) {
-        Write-Log "Descargando NSSM..." "WARNING"
-        # Descargar NSSM si no existe
-        $nssmUrl = "https://nssm.cc/release/nssm-2.24.zip"
-        $tempZip = Join-Path $env:TEMP "nssm.zip"
-        Invoke-WebRequest -Uri $nssmUrl -OutFile $tempZip
-
-        # Extraer
-        $tempDir = Join-Path $env:TEMP "nssm"
-        Expand-Archive -Path $tempZip -DestinationPath $tempDir -Force
-
-        # Copiar nssm.exe
-        $nssmSource = Get-ChildItem -Path $tempDir -Recurse -Filter "nssm.exe" | Select-Object -First 1
-        Copy-Item -Path $nssmSource.FullName -Destination $nssmPath -Force
+# Verificar .env
+$envFile = Join-Path $BotDir ".env"
+if (-not (Test-Path $envFile)) {
+    Write-Host ".env no encontrado. Crea uno desde .env.example" -ForegroundColor Yellow
+    $envExample = Join-Path $BotDir ".env.example"
+    if (Test-Path $envExample) {
+        Copy-Item $envExample $envFile
+        Write-Host ".env creado desde .env.example. Edita con tus credenciales." -ForegroundColor Green
     }
+}
 
-    # Instalar servicio
-    & $nssmPath install $ServiceName $PythonExe "$ScriptDirectory\$MainScript"
-    & $nssmPath set $ServiceName AppDirectory $ScriptDirectory
-    & $nssmPath set $ServiceName DisplayName "Trading Bot Service"
-    & $nssmPath set $ServiceName Description "Bot de Trading Automatizado para BingX y Bybit"
-    & $nssmPath set $ServiceName Start SERVICE_AUTO_START
-    & $nssmPath set $ServiceName AppStdout (Join-Path $LogDir "service_stdout.log")
-    & $nssmPath set $ServiceName AppStderr (Join-Path $LogDir "service_stderr.log")
+# Verificar config.json
+$configFile = Join-Path $BotDir "config.json"
+if (-not (Test-Path $configFile)) {
+    Write-Host "config.json no encontrado. Este archivo es obligatorio." -ForegroundColor Red
+    exit 1
+}
+
+# 4. OPCION: Crear tarea programada
+if ($ScheduleTask) {
+    Write-Host ""
+    Write-Host "Creando tarea programada..." -ForegroundColor Cyan
+
+    $action = New-ScheduledTaskAction `
+        -Execute "powershell.exe" `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$BotDir\windows.ps1`" -StartService"
+
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $action `
+        -Trigger $trigger `
+        -Principal $principal `
+        -Settings $settings `
+        -Description $TaskDescription `
+        -Force
+
+    Write-Host "Tarea programada creada: $TaskName" -ForegroundColor Green
+    Write-Host "Se ejecutara automaticamente al inicio del sistema." -ForegroundColor Yellow
+
+    # Iniciar ahora
+    Start-ScheduledTask -TaskName $TaskName
+    Write-Host "Tarea iniciada. El bot se ejecutara en segundo plano." -ForegroundColor Green
+}
+
+# 5. OPCIÓN: Instalar como servicio Windows
+if ($InstallService) {
+    Write-Host ""
+    Write-Host "Instalando como servicio Windows..." -ForegroundColor Cyan
+
+    # Ejecutar windows.ps1 con parametro de servicio
+    & "$BotDir\windows.ps1" -InstallService
+
+    Write-Host ""
+    Write-Host "Para gestionar el servicio:" -ForegroundColor Yellow
+    Write-Host "   Iniciar:    sc start TradingBotService" -ForegroundColor Gray
+    Write-Host "   Detener:    sc stop TradingBotService" -ForegroundColor Gray
+    Write-Host "   Estado:     sc query TradingBotService" -ForegroundColor Gray
+    Write-Host "   Desinstalar: sc delete TradingBotService" -ForegroundColor Gray
+}
+
+# 6. OPCION: Inicio rapido
+if ($QuickStart) {
+    Write-Host ""
+    Write-Host "Iniciando bot rapidamente..." -ForegroundColor Cyan
+
+    # Crear directorio de logs
+    $logDir = Join-Path $BotDir "logs"
+    if (-not (Test-Path $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
 
     # Configurar entorno
-    & $nssmPath set $ServiceName AppEnvironmentExtra "PYTHONUTF8=1"
-
-    Write-Log "Servicio instalado. Usa: windows.ps1 -StartService" "INFO"
-}
-
-# Función para iniciar el bot directamente (sin servicio)
-function Start-TradingBot {
-    $isRunning, $pid = Test-BotRunning
-
-    if ($isRunning) {
-        Write-Log "El bot ya está corriendo (PID: $pid)" "WARNING"
-        return $false
-    }
-
-    Write-Log "Iniciando bot de trading..." "INFO"
-    Write-Log "Directorio: $ScriptDirectory" "INFO"
-    Write-Log "Script: $MainScript" "INFO"
-
-    # Configurar encoding
     $env:PYTHONUTF8 = "1"
     $env:PYTHONIOENCODING = "utf-8"
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-    # Cambiar al directorio del script
-    Set-Location $ScriptDirectory
+    # Iniciar bot
+    $process = Start-Process python `
+        -ArgumentList "main.py" `
+        -WorkingDirectory $BotDir `
+        -NoNewWindow `
+        -RedirectStandardOutput "$logDir\bot_$(Get-Date -Format 'yyyyMMdd_HHmmss').log" `
+        -RedirectStandardError "$logDir\bot_error_$(Get-Date -Format 'yyyyMMdd_HHmmss').log" `
+        -PassThru
 
-    # Iniciar el bot en segundo plano
-    $processStartInfo = @{
-        FileName = $PythonExe
-        Arguments = $MainScript
-        WorkingDirectory = $ScriptDirectory
-        RedirectStandardOutput = (Join-Path $LogDir "bot_output.log")
-        RedirectStandardError = (Join-Path $LogDir "bot_error.log")
-        UseShellExecute = $false
-        CreateNoWindow = $true
-    }
-
-    $process = Start-Process @processStartInfo -PassThru
-
-    # Guardar PID
-    $process.Id | Out-File -FilePath $PIDFile -Encoding UTF8
-
-    Write-Log "Bot iniciado con PID: $($process.Id)" "INFO"
-    Write-Log "Logs en: $LogDir" "INFO"
-
-    return $true
+    Write-Host "Bot iniciado con PID: $($process.Id)" -ForegroundColor Green
+    Write-Host "Ver logs en: $logDir" -ForegroundColor Yellow
+    Write-Host "Puedes cerrar esta ventana SSH, el bot seguira corriendo." -ForegroundColor Cyan
 }
 
-# Función para detener el bot
-function Stop-TradingBot {
-    $isRunning, $pid = Test-BotRunning
-
-    if (-not $isRunning) {
-        Write-Log "El bot no está corriendo" "WARNING"
-        return $false
-    }
-
-    Write-Log "Deteniendo bot (PID: $pid)..." "INFO"
-
-    try {
-        Stop-Process -Id $pid -Force -ErrorAction Stop
-        Write-Log "Bot detenido exitosamente" "INFO"
-
-        # Eliminar archivo PID
-        if (Test-Path $PIDFile) {
-            Remove-Item $PIDFile -Force
-        }
-
-        return $true
-    } catch {
-        Write-Log "Error deteniendo bot: $_" "ERROR"
-        return $false
-    }
+# 7. Si no hay parametros, mostrar menu
+if (-not ($ScheduleTask -or $InstallService -or $QuickStart)) {
+    Write-Host ""
+    Write-Host "OPCIONES DE IMPLEMENTACION:" -ForegroundColor Cyan
+    Write-Host "1. Ejecutar deploy_windows.ps1 -QuickStart (inicio rapido)" -ForegroundColor Yellow
+    Write-Host "2. Ejecutar deploy_windows.ps1 -ScheduleTask (tarea programada)" -ForegroundColor Yellow
+    Write-Host "3. Ejecutar deploy_windows.ps1 -InstallService (servicio Windows)" -ForegroundColor Yellow
+    Write-Host "4. Usar windows.ps1 interactivo (gestion manual)" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Recomendacion: Usa -ScheduleTask para ejecucion automatica." -ForegroundColor Green
 }
 
-# Función para verificar estado
-function Get-BotStatus {
-    $isRunning, $pid = Test-BotRunning
-
-    if ($isRunning) {
-        Write-Log "✅ Bot CORRIENDO (PID: $pid)" "INFO"
-
-        # Verificar memoria y CPU
-        try {
-            $process = Get-Process -Id $pid -ErrorAction SilentlyContinue
-            if ($process) {
-                $cpu = "{0:N1}" -f $process.CPU
-                $mem = "{0:N1}" -f ($process.WorkingSet64 / 1MB)
-                $uptime = (Get-Date) - $process.StartTime
-
-                Write-Log "   Uptime: $($uptime.ToString('dd\.hh\:mm\:ss'))" "INFO"
-                Write-Log "   Memoria: ${mem}MB | CPU: ${cpu}%" "INFO"
-            }
-        } catch {
-            Write-Log "   No se pudo obtener información detallada" "WARNING"
-        }
-
-        # Verificar últimos logs
-        $recentLogs = Get-Content $LogFile -Tail 5 -ErrorAction SilentlyContinue
-        if ($recentLogs) {
-            Write-Log "   Últimas 5 líneas del log:" "INFO"
-            $recentLogs | ForEach-Object { Write-Log "   $_" "INFO" }
-        }
-
-        return $true
-    } else {
-        Write-Log "❌ Bot DETENIDO" "INFO"
-        return $false
-    }
-}
-
-# Menú principal
-Write-Log "=== Trading Bot Manager ===" "INFO"
-Write-Log "Directorio: $ScriptDirectory" "INFO"
-
-if ($InstallService) {
-    Install-TradingService
-}
-elseif ($UninstallService) {
-    Write-Log "Para desinstalar servicio: sc delete $ServiceName" "INFO"
-}
-elseif ($StartService) {
-    Start-TradingBot
-}
-elseif ($StopService) {
-    Stop-TradingBot
-}
-elseif ($CheckStatus) {
-    Get-BotStatus
-}
-else {
-    # Modo interactivo
-    Write-Host "`n=== Trading Bot Manager ===" -ForegroundColor Cyan
-    Write-Host "1. Iniciar bot (sesión actual)"
-    Write-Host "2. Detener bot"
-    Write-Host "3. Verificar estado"
-    Write-Host "4. Instalar como servicio Windows (ejecuta sin sesión)"
-    Write-Host "5. Salir"
-
-    $choice = Read-Host "`nSelecciona una opción (1-5)"
-
-    switch ($choice) {
-        "1" {
-            if (Start-TradingBot) {
-                Write-Host "`n✅ Bot iniciado. Puedes cerrar esta ventana." -ForegroundColor Green
-                Write-Host "📊 Para ver logs: Get-Content '$LogFile' -Tail 20 -Wait" -ForegroundColor Yellow
-            }
-        }
-        "2" { Stop-TradingBot }
-        "3" { Get-BotStatus }
-        "4" { Install-TradingService }
-        "5" { exit }
-        default { Write-Host "Opción inválida" -ForegroundColor Red }
-    }
-}
+Write-Host ""
+Write-Host "=== DEPLOY COMPLETADO ===" -ForegroundColor Green
