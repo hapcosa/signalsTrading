@@ -1,0 +1,33 @@
+{
+  "general": {
+    "log_level": "INFO",
+    "priority_exchange": "bingx"
+  },
+  "trading": {
+    "usdt_margin_per_trade": 2,
+    "default_leverage": 10,
+    "trailing_stop_percent": 2.0,
+    "trailing_stop_distance": 1.0,
+    "max_open_positions": 5
+  },
+  "take_profit": {
+    "tp1_percent": 2.0,
+    "tp2_percent": 3.5,
+    "tp3_percent": 5.0,
+    "tp1_distribution": 30,
+    "tp2_distribution": 30,
+    "tp3_distribution": 30
+  },
+  "risk_management": {
+    "default_sl_percent": 1.8,
+    "max_position_size_percent": 10,
+    "min_balance_required": 50
+  },
+  "notifications": {
+    "notify_on_open": true,
+    "notify_on_close": true,
+    "notify_on_tp": true,
+    "notify_on_sl": true,
+    "notify_on_error": true
+  }
+}
