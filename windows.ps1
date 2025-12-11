@@ -1,256 +1,98 @@
-# windows.ps1 - Script optimizado para trading bot
-param(
-    [switch]$InstallService,
-    [switch]$UninstallService,
-    [switch]$StartService,
-    [switch]$StopService,
-    [switch]$CheckStatus
-)
+# windows.ps1
 
-# Configuracion
-$ScriptDirectory = $PSScriptRoot
-$ServiceName = "TradingBotService"
-$PythonExe = "python.exe"
-$MainScript = "main.py"
-$LogDir = Join-Path $ScriptDirectory "logs"
-$LogFile = Join-Path $LogDir "trading_bot_$(Get-Date -Format 'yyyyMMdd').log"
-$PIDFile = Join-Path $ScriptDirectory "trading_bot.pid"
+# Obtener la ruta del script actual para usar rutas absolutas
+$ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+$LogPath = Join-Path $ScriptDirectory "execution_log.txt"
+$OutputLogPath = Join-Path $ScriptDirectory "output_log.txt"
 
-# Crear directorio de logs si no existe
-if (-not (Test-Path $LogDir)) {
-    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
-}
+# Configurar encoding UTF-8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 
-# Funcion para escribir logs
-function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $LogMessage = "[$Timestamp] [$Level] $Message"
-    Add-Content -Path $LogFile -Value $LogMessage -Encoding UTF8
-    Write-Host $LogMessage
-}
+# Forzar el cambio al directorio del script
+Set-Location $ScriptDirectory
 
-# Funcion para verificar si el bot ya esta corriendo
-function Test-BotRunning {
-    $pid = $null
-    if (Test-Path $PIDFile) {
-        $pid = Get-Content $PIDFile -ErrorAction SilentlyContinue
-    }
+# Registrar inicio con información de diagnóstico
+$Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+"[$Timestamp] ===== INICIANDO APPLICACION =====" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+"[$Timestamp] Directorio del script: $ScriptDirectory" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+"[$Timestamp] Directorio de trabajo actual: $(Get-Location)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+"[$Timestamp] Usuario: $env:USERNAME" | Out-File -FilePath $LogPath -Append -Encoding UTF8
 
-    if ($pid) {
-        try {
-            $process = Get-Process -Id $pid -ErrorAction SilentlyContinue
-            if ($process -and $process.ProcessName -like "*python*") {
-                $cmdLine = (Get-WmiObject Win32_Process -Filter "ProcessId = $pid").CommandLine
-                if ($cmdLine -like "*$MainScript*") {
-                    return $true, $pid
-                }
-            }
-        } catch {
-            # PID invalido
-        }
-    }
+# Verificar entorno virtual - Método alternativo para SYSTEM
+$VenvPath = Join-Path (Split-Path -Parent $ScriptDirectory) "venv"
+$PythonExe = Join-Path $VenvPath "Scripts\python.exe"
 
-    # Buscar por linea de comandos
-    $processes = Get-WmiObject Win32_Process | Where-Object {
-        $_.CommandLine -like "*$MainScript*" -and $_.Name -like "*python*"
-    }
+"[$Timestamp] Buscando entorno virtual en: $VenvPath" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+"[$Timestamp] Python ejecutable: $PythonExe" | Out-File -FilePath $LogPath -Append -Encoding UTF8
 
-    if ($processes) {
-        $pid = $processes[0].ProcessId
-        $pid | Out-File -FilePath $PIDFile -Encoding UTF8
-        return $true, $pid
-    }
+if (Test-Path $PythonExe) {
+    "[$Timestamp] Usando Python del entorno virtual: $PythonExe" | Out-File -FilePath $LogPath -Append -Encoding UTF8
 
-    return $false, $null
-}
+    # Configurar variables de entorno para el entorno virtual
+    $env:VIRTUAL_ENV = $VenvPath
+    $env:PATH = "$(Join-Path $VenvPath 'Scripts');$env:PATH"
 
-# Funcion para instalar como servicio con NSSM
-function Install-TradingService {
-    Write-Log "Instalando servicio $ServiceName..."
+    "[$Timestamp] Entorno virtual configurado manualmente" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+} else {
+    "[$Timestamp] ERROR: Python del entorno virtual no encontrado en $PythonExe" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+    "[$Timestamp] Verificando Python del sistema..." | Out-File -FilePath $LogPath -Append -Encoding UTF8
 
-    # Verificar NSSM
-    $nssmPath = Join-Path $ScriptDirectory "nssm.exe"
-    if (-not (Test-Path $nssmPath)) {
-        Write-Log "Descargando NSSM..." "WARNING"
-        # Descargar NSSM si no existe
-        $nssmUrl = "https://nssm.cc/release/nssm-2.24.zip"
-        $tempZip = Join-Path $env:TEMP "nssm.zip"
-        Invoke-WebRequest -Uri $nssmUrl -OutFile $tempZip
-
-        # Extraer
-        $tempDir = Join-Path $env:TEMP "nssm"
-        Expand-Archive -Path $tempZip -DestinationPath $tempDir -Force
-
-        # Copiar nssm.exe
-        $nssmSource = Get-ChildItem -Path $tempDir -Recurse -Filter "nssm.exe" | Select-Object -First 1
-        Copy-Item -Path $nssmSource.FullName -Destination $nssmPath -Force
-    }
-
-    # Instalar servicio
-    & $nssmPath install $ServiceName $PythonExe "$ScriptDirectory\$MainScript"
-    & $nssmPath set $ServiceName AppDirectory $ScriptDirectory
-    & $nssmPath set $ServiceName DisplayName "Trading Bot Service"
-    & $nssmPath set $ServiceName Description "Bot de Trading Automatizado para BingX y Bybit"
-    & $nssmPath set $ServiceName Start SERVICE_AUTO_START
-    & $nssmPath set $ServiceName AppStdout (Join-Path $LogDir "service_stdout.log")
-    & $nssmPath set $ServiceName AppStderr (Join-Path $LogDir "service_stderr.log")
-
-    # Configurar entorno
-    & $nssmPath set $ServiceName AppEnvironmentExtra "PYTHONUTF8=1"
-
-    Write-Log "Servicio instalado. Usa: windows.ps1 -StartService" "INFO"
-}
-
-# Funcion para iniciar el bot directamente (sin servicio)
-function Start-TradingBot {
-    $isRunning, $pid = Test-BotRunning
-
-    if ($isRunning) {
-        Write-Log "El bot ya esta corriendo (PID: $pid)" "WARNING"
-        return $false
-    }
-
-    Write-Log "Iniciando bot de trading..." "INFO"
-    Write-Log "Directorio: $ScriptDirectory" "INFO"
-    Write-Log "Script: $MainScript" "INFO"
-
-    # Configurar encoding
-    $env:PYTHONUTF8 = "1"
-    $env:PYTHONIOENCODING = "utf-8"
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-
-    # Cambiar al directorio del script
-    Set-Location $ScriptDirectory
-
-    # Iniciar el bot en segundo plano
-    $processStartInfo = @{
-        FileName = $PythonExe
-        Arguments = $MainScript
-        WorkingDirectory = $ScriptDirectory
-        RedirectStandardOutput = (Join-Path $LogDir "bot_output.log")
-        RedirectStandardError = (Join-Path $LogDir "bot_error.log")
-        UseShellExecute = $false
-        CreateNoWindow = $true
-    }
-
-    $process = Start-Process @processStartInfo -PassThru
-
-    # Guardar PID
-    $process.Id | Out-File -FilePath $PIDFile -Encoding UTF8
-
-    Write-Log "Bot iniciado con PID: $($process.Id)" "INFO"
-    Write-Log "Logs en: $LogDir" "INFO"
-
-    return $true
-}
-
-# Funcion para detener el bot
-function Stop-TradingBot {
-    $isRunning, $pid = Test-BotRunning
-
-    if (-not $isRunning) {
-        Write-Log "El bot no esta corriendo" "WARNING"
-        return $false
-    }
-
-    Write-Log "Deteniendo bot (PID: $pid)..." "INFO"
-
+    # Intentar con Python del sistema
     try {
-        Stop-Process -Id $pid -Force -ErrorAction Stop
-        Write-Log "Bot detenido exitosamente" "INFO"
-
-        # Eliminar archivo PID
-        if (Test-Path $PIDFile) {
-            Remove-Item $PIDFile -Force
+        $PythonVersion = python --version 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            "[$Timestamp] Usando Python del sistema: $PythonVersion" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+        } else {
+            "[$Timestamp] ERROR: Python no disponible" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+            exit 1
         }
-
-        return $true
     } catch {
-        Write-Log "Error deteniendo bot: $_" "ERROR"
-        return $false
+        "[$Timestamp] ERROR: No se puede ejecutar python - $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+        exit 1
     }
 }
 
-# Funcion para verificar estado
-function Get-BotStatus {
-    $isRunning, $pid = Test-BotRunning
+# Verificar que main.py existe
+$MainScript = Join-Path (Split-Path -Parent $ScriptDirectory) "main.py"
+"[$Timestamp] Buscando script: $MainScript" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+if (-not (Test-Path $MainScript)) {
+    "[$Timestamp] ERROR: main.py no encontrado" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+    exit 1
+}
 
-    if ($isRunning) {
-        Write-Log "BOT CORRIENDO (PID: $pid)" "INFO"
+# Ejecutar main.py usando el Python del entorno virtual si está disponible
+"[$Timestamp] Ejecutando: $PythonExe main.py" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+try {
+    $ParentDirectory = Split-Path -Parent $ScriptDirectory
 
-        # Verificar memoria y CPU
-        try {
-            $process = Get-Process -Id $pid -ErrorAction SilentlyContinue
-            if ($process) {
-                $cpu = "{0:N1}" -f $process.CPU
-                $mem = "{0:N1}" -f ($process.WorkingSet64 / 1MB)
-                $uptime = (Get-Date) - $process.StartTime
-
-                Write-Log "   Uptime: $($uptime.ToString('dd\.hh\:mm\:ss'))" "INFO"
-                Write-Log "   Memoria: ${mem}MB | CPU: ${cpu}%" "INFO"
-            }
-        } catch {
-            Write-Log "   No se pudo obtener informacion detallada" "WARNING"
-        }
-
-        # Verificar ultimos logs
-        $recentLogs = Get-Content $LogFile -Tail 5 -ErrorAction SilentlyContinue
-        if ($recentLogs) {
-            Write-Log "   Ultimas 5 lineas del log:" "INFO"
-            $recentLogs | ForEach-Object { Write-Log "   $_" "INFO" }
-        }
-
-        return $true
+    if (Test-Path $PythonExe) {
+        # Usar el Python del entorno virtual directamente
+        $Process = Start-Process -FilePath $PythonExe -ArgumentList "main.py" -WorkingDirectory $ParentDirectory -Wait -PassThru -NoNewWindow -RedirectStandardOutput $OutputLogPath -RedirectStandardError "$OutputLogPath.errors"
     } else {
-        Write-Log "BOT DETENIDO" "INFO"
-        return $false
+        # Usar Python del sistema
+        $Process = Start-Process -FilePath "python" -ArgumentList "main.py" -WorkingDirectory $ParentDirectory -Wait -PassThru -NoNewWindow -RedirectStandardOutput $OutputLogPath -RedirectStandardError "$OutputLogPath.errors"
     }
-}
 
-# Menu principal
-Write-Log "=== Trading Bot Manager ===" "INFO"
-Write-Log "Directorio: $ScriptDirectory" "INFO"
+    "[$Timestamp] Script finalizado con código de salida: $($Process.ExitCode)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
 
-if ($InstallService) {
-    Install-TradingService
-}
-elseif ($UninstallService) {
-    Write-Log "Para desinstalar servicio: sc delete $ServiceName" "INFO"
-}
-elseif ($StartService) {
-    Start-TradingBot
-}
-elseif ($StopService) {
-    Stop-TradingBot
-}
-elseif ($CheckStatus) {
-    Get-BotStatus
-}
-else {
-    # Modo interactivo
-    Write-Host ""
-    Write-Host "=== Trading Bot Manager ===" -ForegroundColor Cyan
-    Write-Host "1. Iniciar bot (sesion actual)"
-    Write-Host "2. Detener bot"
-    Write-Host "3. Verificar estado"
-    Write-Host "4. Instalar como servicio Windows (ejecuta sin sesion)"
-    Write-Host "5. Salir"
+    if (Test-Path $OutputLogPath) {
+        $LogSize = (Get-Item $OutputLogPath).Length
+        "[$Timestamp] Log de output creado: $OutputLogPath ($LogSize bytes)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+    }
 
-    $choice = Read-Host "Selecciona una opcion (1-5)"
-
-    switch ($choice) {
-        "1" {
-            if (Start-TradingBot) {
-                Write-Host ""
-                Write-Host "Bot iniciado. Puedes cerrar esta ventana." -ForegroundColor Green
-                Write-Host "Para ver logs: Get-Content '$LogFile' -Tail 20 -Wait" -ForegroundColor Yellow
-            }
+    if (Test-Path "$OutputLogPath.errors") {
+        $ErrorLogSize = (Get-Item "$OutputLogPath.errors").Length
+        "[$Timestamp] Log de errores creado: $OutputLogPath.errors ($ErrorLogSize bytes)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+        if ($ErrorLogSize -gt 0) {
+            "[$Timestamp] Contenido de errores:" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+            Get-Content "$OutputLogPath.errors" | Out-File -FilePath $LogPath -Append -Encoding UTF8
         }
-        "2" { Stop-TradingBot }
-        "3" { Get-BotStatus }
-        "4" { Install-TradingService }
-        "5" { exit }
-        default { Write-Host "Opcion invalida" -ForegroundColor Red }
     }
+} catch {
+    "[$Timestamp] ERROR al ejecutar main.py: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Append -Encoding UTF8
 }
+
+"[$Timestamp] ===== SCRIPT FINALIZADO =====" | Out-File -FilePath $LogPath -Append -Encoding UTF8
