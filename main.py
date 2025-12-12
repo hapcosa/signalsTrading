@@ -410,17 +410,31 @@ class TradingBot:
         self.active_positions = {}
         self.exchanges = []
 
+        # Cuenta 1 de BingX
         bingx_key = os.getenv("BINGX_API_KEY")
         bingx_secret = os.getenv("BINGX_SECRET_KEY")
 
         if bingx_key and bingx_secret:
-            self.bingx = BingXAPI(bingx_key, bingx_secret)
-            if self.bingx.is_available():
-                self.exchanges.append(self.bingx)
-                logger.info("✅ BingX inicializado")
+            bingx1 = BingXAPI(bingx_key, bingx_secret)
+            bingx1.name = "BingX-1"  # Nombre personalizado
+            if bingx1.is_available():
+                self.exchanges.append(bingx1)
+                logger.info("✅ BingX Cuenta 1 inicializada")
         else:
-            self.bingx = None
-            logger.error("❌ BingX no configurado")
+            logger.warning("⚠️ BingX Cuenta 1 no configurada")
+
+        # Cuenta 2 de BingX
+        bingx2_key = os.getenv("BINGX2_API_KEY")
+        bingx2_secret = os.getenv("BINGX2_SECRET_KEY")
+
+        if bingx2_key and bingx2_secret:
+            bingx2 = BingXAPI(bingx2_key, bingx2_secret)
+            bingx2.name = "BingX-2"  # Nombre personalizado
+            if bingx2.is_available():
+                self.exchanges.append(bingx2)
+                logger.info("✅ BingX Cuenta 2 inicializada")
+        else:
+            logger.warning("⚠️ BingX Cuenta 2 no configurada")
 
         if not self.exchanges:
             logger.error("❌ No hay exchanges configurados")
@@ -614,30 +628,63 @@ class TradingBot:
             return {"success": False, "error": str(e)}
 
     def close_trade(self, signal: Dict) -> Dict:
-        """Cierra trade"""
+        """Cierra trade en todas las cuentas"""
         try:
             symbol_raw = signal["symbol"]
+            results = []
+            all_success = True
 
-            for key, pos in self.active_positions.items():
-                if symbol_raw in pos["symbol"]:
-                    exchange = next((ex for ex in self.exchanges if ex.name == pos["exchange"]), None)
-                    if exchange:
-                        symbol = self.normalize_symbol(symbol_raw, exchange)
-                        logger.info(f"🔴 Cerrando {symbol}")
+            # Intentar cerrar en todas las cuentas
+            for exchange in self.exchanges:
+                logger.info(f"\n{'=' * 50}")
+                logger.info(f"🎯 Cerrando en {exchange.name}")
+                logger.info(f"{'=' * 50}")
 
-                        result = exchange.close_position(symbol)
-
-                        if result["success"]:
-                            del self.active_positions[key]
-
-                        return result
-
-            exchange = self.exchanges[0] if self.exchanges else None
-            if exchange:
                 symbol = self.normalize_symbol(symbol_raw, exchange)
-                return exchange.close_position(symbol)
 
-            return {"success": False, "error": "Posición no encontrada"}
+                # Verificar si hay posición abierta
+                if not self.check_existing_position(exchange, symbol):
+                    logger.info(f"ℹ️ {exchange.name}: No hay posición abierta para {symbol}")
+                    results.append({
+                        "exchange": exchange.name,
+                        "success": False,
+                        "error": "No hay posición abierta"
+                    })
+                    continue
+
+                logger.info(f"🔴 Cerrando {symbol}")
+
+                result = exchange.close_position(symbol)
+
+                if result["success"]:
+                    # Eliminar de posiciones activas
+                    key = f"{exchange.name}_{symbol}"
+                    if key in self.active_positions:
+                        del self.active_positions[key]
+
+                    results.append({
+                        "exchange": exchange.name,
+                        "success": True
+                    })
+                else:
+                    all_success = False
+                    results.append({
+                        "exchange": exchange.name,
+                        "success": False,
+                        "error": result.get("error", "Error desconocido")
+                    })
+
+            if not results:
+                return {"success": False, "error": "No se encontraron posiciones en ninguna cuenta"}
+
+            return {
+                "success": all_success,
+                "multi_account": True,
+                "results": results,
+                "total_accounts": len(self.exchanges),
+                "closed_accounts": sum(1 for r in results if r.get("success"))
+            }
+
         except Exception as e:
             logger.error(f"❌ Error cerrando: {e}")
             return {"success": False, "error": str(e)}
