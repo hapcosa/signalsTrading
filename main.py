@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """
 Bot de Trading Automatizado para BingX - FUTUROS USDT ISOLATED
-Recibe señales de TradingView vía Telegram (canal/grupo) y ejecuta trades
-
-CONFIGURACIÓN:
-1. Bot emisor (TradingView): Envía señales al canal/grupo
-2. Este bot: Lee las señales y ejecuta operaciones
-
-Formato: BUY BTC, SELL ETH, CLOSE BTC
+Usa Telethon (userbot) para leer mensajes de otros bots en Telegram
 """
 
 import os
@@ -16,13 +10,13 @@ import logging
 from typing import Dict, Optional, List
 from datetime import datetime
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+from telethon import TelegramClient, events
 import hmac
 import hashlib
 import time
 import requests
 import re
+import asyncio
 
 load_dotenv()
 
@@ -228,23 +222,18 @@ class BingXAPI(ExchangeAPI):
                       trailing_stop_percent: float) -> Dict:
         """Abre posición en futuros USDT ISOLATED"""
         try:
-            # 1. Configurar margin mode
             self.set_margin_mode(symbol, "ISOLATED")
 
-            # 2. Precio actual
             current_price = self.get_current_price(symbol)
             if current_price == 0:
                 return {"success": False, "error": "No se pudo obtener precio"}
 
-            # 3. Calcular tamaño
             quantity = self.calculate_position_size(symbol, usdt_amount, leverage, current_price)
             if quantity == 0:
                 return {"success": False, "error": f"Cantidad = 0. Aumenta margen (actual: ${usdt_amount})"}
 
-            # 4. Configurar apalancamiento
             self._set_leverage(symbol, leverage)
 
-            # 5. Calcular TP y SL
             if side == "BUY":
                 tp_prices = [current_price * (1 + tp / 100) for tp in tp_percent]
                 sl_price = current_price * (1 - sl_percent / 100)
@@ -252,7 +241,6 @@ class BingXAPI(ExchangeAPI):
                 tp_prices = [current_price * (1 - tp / 100) for tp in tp_percent]
                 sl_price = current_price * (1 + sl_percent / 100)
 
-            # 6. Abrir posición
             endpoint = "/openApi/swap/v2/trade/order"
             timestamp = int(time.time() * 1000)
 
@@ -275,11 +263,9 @@ class BingXAPI(ExchangeAPI):
                 logger.info(f"   {symbol} | {side} | Qty: {quantity}")
                 logger.info(f"   Precio: ${current_price:.2f} | Margen: ${usdt_amount}")
 
-                # 7. Stop Loss
                 self._set_stop_loss(symbol, side, sl_price, quantity)
                 logger.info(f"   SL: ${sl_price:.2f}")
 
-                # 8. Take Profits
                 tp_levels = [
                     {"price": tp_prices[0], "percentage": 30},
                     {"price": tp_prices[1], "percentage": 30},
@@ -288,7 +274,6 @@ class BingXAPI(ExchangeAPI):
                 self._set_take_profits(symbol, side, tp_levels, quantity)
                 logger.info(f"   TP1: ${tp_prices[0]:.2f} | TP2: ${tp_prices[1]:.2f} | TP3: ${tp_prices[2]:.2f}")
 
-                # 9. Trailing Stop
                 self._set_trailing_stop(symbol, side, trailing_stop_percent)
                 logger.info(f"   Trailing: {trailing_stop_percent}%")
 
@@ -416,12 +401,10 @@ class TradingBot:
 
         if bingx_key and bingx_secret:
             bingx1 = BingXAPI(bingx_key, bingx_secret)
-            bingx1.name = "BingX-1"  # Nombre personalizado
+            bingx1.name = "BingX-1"
             if bingx1.is_available():
                 self.exchanges.append(bingx1)
                 logger.info("✅ BingX Cuenta 1 inicializada")
-        else:
-            logger.warning("⚠️ BingX Cuenta 1 no configurada")
 
         # Cuenta 2 de BingX
         bingx2_key = os.getenv("BINGX2_API_KEY")
@@ -429,59 +412,34 @@ class TradingBot:
 
         if bingx2_key and bingx2_secret:
             bingx2 = BingXAPI(bingx2_key, bingx2_secret)
-            bingx2.name = "BingX-2"  # Nombre personalizado
+            bingx2.name = "BingX-2"
             if bingx2.is_available():
                 self.exchanges.append(bingx2)
                 logger.info("✅ BingX Cuenta 2 inicializada")
-        else:
-            logger.warning("⚠️ BingX Cuenta 2 no configurada")
 
         if not self.exchanges:
             logger.error("❌ No hay exchanges configurados")
 
-        # IMPORTANTE: Chat/Canal autorizado (puede ser grupo o canal)
-        self.authorized_chat_id = os.getenv("TELEGRAM_CHAT_ID")
-
     def normalize_symbol(self, symbol: str, exchange: ExchangeAPI) -> str:
-        """
-        Normaliza símbolo para BingX: BTC -> BTC-USDT
-        Soporta formatos de TradingView:
-        - BINANCE:BTCUSDT -> BTC-USDT
-        - BTCUSDT -> BTC-USDT
-        - BTC -> BTC-USDT
-        """
+        """Normaliza símbolo para BingX: BTC -> BTC-USDT"""
         symbol = symbol.upper().strip()
 
-        # Remover exchange prefix (BINANCE:, BYBIT:, etc)
         if ":" in symbol:
             symbol = symbol.split(":")[1]
 
-        # Si ya tiene formato correcto
         if "-USDT" in symbol:
             return symbol
 
-        # Si termina en USDT, removerlo
         if symbol.endswith("USDT"):
             symbol = symbol[:-4]
 
-        # Agregar -USDT
         return f"{symbol}-USDT"
 
     def parse_signal(self, message: str) -> Optional[Dict]:
-        """
-        Parsea señales en múltiples formatos:
-        - BUY BTC
-        - SELL ETH
-        - CLOSE BTC
-        - BUY BINANCE:BTCUSDT (TradingView)
-        - SELL ETHUSDT
-        """
+        """Parsea señales: BUY BTC, SELL ETH, CLOSE BTC"""
         try:
             message = message.strip().upper()
-
-            # Patrón: ACCION SIMBOLO (permite : y letras)
             pattern = r'^(BUY|SELL|CLOSE)\s+([A-Z0-9:]+)$'
-
             match = re.match(pattern, message)
 
             if not match:
@@ -490,11 +448,9 @@ class TradingBot:
             action = match.group(1)
             symbol = match.group(2)
 
-            # Limpiar símbolo (remover exchange prefix si existe)
             if ":" in symbol:
                 symbol = symbol.split(":")[1]
 
-            # Remover USDT si viene pegado
             if symbol.endswith("USDT") and len(symbol) > 4:
                 symbol = symbol[:-4]
 
@@ -542,18 +498,18 @@ class TradingBot:
             logger.error(f"Error verificando posición contraria: {e}")
             return None
 
-    def execute_signal(self, signal: Dict) -> Dict:
+    async def execute_signal(self, signal: Dict) -> Dict:
         """Ejecuta la señal"""
         if signal["action"] == "open":
-            return self.open_trade(signal)
+            return await self.open_trade(signal)
         elif signal["action"] == "close":
-            return self.close_trade(signal)
+            return await self.close_trade(signal)
         return {"success": False, "error": "Acción no reconocida"}
 
-    def open_trade(self, signal: Dict) -> Dict:
+    async def open_trade(self, signal: Dict) -> Dict:
         """Abre trade"""
         try:
-            usdt_amount = self.config.get("trading", "usdt_margin_per_trade", default=100)
+            usdt_amount = self.config.get("trading", "usdt_margin_per_trade", default=5.0)
             leverage = self.config.get("trading", "default_leverage", default=10)
             min_balance = self.config.get("risk_management", "min_balance_required", default=50)
 
@@ -571,7 +527,6 @@ class TradingBot:
 
             logger.info(f"📊 {signal['symbol']} -> {symbol}")
 
-            # Verificar si ya existe posición
             if self.check_existing_position(exchange, symbol):
                 logger.warning(f"⚠️ Ya existe posición para {symbol}")
                 return {
@@ -579,7 +534,6 @@ class TradingBot:
                     "error": f"Ya hay posición abierta en {symbol}. Usa CLOSE {signal['symbol']} primero"
                 }
 
-            # Verificar posición contraria
             opposite_pos = self.check_opposite_position(exchange, symbol, side)
 
             if opposite_pos and opposite_pos.get("exists"):
@@ -595,16 +549,16 @@ class TradingBot:
                     }
 
                 logger.info("✅ Contraria cerrada")
-                time.sleep(2)
+                await asyncio.sleep(2)
 
             tp_percent = [
                 self.config.get("take_profit", "tp1_percent", default=2.0),
-                self.config.get("take_profit", "tp2_percent", default=4.0),
-                self.config.get("take_profit", "tp3_percent", default=6.0)
+                self.config.get("take_profit", "tp2_percent", default=3.5),
+                self.config.get("take_profit", "tp3_percent", default=5.0)
             ]
 
-            sl_percent = self.config.get("risk_management", "default_sl_percent", default=2.0)
-            trailing_stop = self.config.get("trading", "trailing_stop_percent", default=1.5)
+            sl_percent = self.config.get("risk_management", "default_sl_percent", default=1.8)
+            trailing_stop = self.config.get("trading", "trailing_stop_percent", default=2.0)
 
             logger.info(f"🚀 Abriendo {side} en {symbol}")
 
@@ -627,14 +581,13 @@ class TradingBot:
             logger.error(f"❌ Error abriendo trade: {e}")
             return {"success": False, "error": str(e)}
 
-    def close_trade(self, signal: Dict) -> Dict:
+    async def close_trade(self, signal: Dict) -> Dict:
         """Cierra trade en todas las cuentas"""
         try:
             symbol_raw = signal["symbol"]
             results = []
             all_success = True
 
-            # Intentar cerrar en todas las cuentas
             for exchange in self.exchanges:
                 logger.info(f"\n{'=' * 50}")
                 logger.info(f"🎯 Cerrando en {exchange.name}")
@@ -642,7 +595,6 @@ class TradingBot:
 
                 symbol = self.normalize_symbol(symbol_raw, exchange)
 
-                # Verificar si hay posición abierta
                 if not self.check_existing_position(exchange, symbol):
                     logger.info(f"ℹ️ {exchange.name}: No hay posición abierta para {symbol}")
                     results.append({
@@ -657,7 +609,6 @@ class TradingBot:
                 result = exchange.close_position(symbol)
 
                 if result["success"]:
-                    # Eliminar de posiciones activas
                     key = f"{exchange.name}_{symbol}"
                     if key in self.active_positions:
                         del self.active_positions[key]
@@ -694,162 +645,93 @@ class TradingBot:
 bot = TradingBot()
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Maneja mensajes del canal/grupo
-    Acepta mensajes de CUALQUIER usuario en el chat autorizado
-    """
-    try:
-        # Verificar que el mensaje venga del canal/grupo autorizado
-        chat_id = str(update.message.chat_id)
-        authorized_chat = bot.authorized_chat_id
+# ============================================================================
+# TELETHON USERBOT - Lee mensajes de otros bots
+# ============================================================================
 
-        if authorized_chat and chat_id != authorized_chat:
-            logger.warning(f"⚠️ Chat no autorizado: {chat_id} (esperado: {authorized_chat})")
-            return
+async def main():
+    """Función principal con Telethon"""
 
-        message = update.message.text
-        user_id = update.message.from_user.id
-        username = update.message.from_user.username or "Unknown"
+    # Credenciales de Telegram API (debes obtenerlas de https://my.telegram.org)
+    api_id = int(os.getenv("TELEGRAM_API_ID"))
+    api_hash = os.getenv("TELEGRAM_API_HASH")
+    phone = os.getenv("TELEGRAM_PHONE")  # Tu número de teléfono
 
-        logger.info(f"📨 Señal de @{username} (ID: {user_id}): {message}")
+    # Chat/grupo donde escuchar
+    target_chat_id = int(os.getenv("TELEGRAM_CHAT_ID"))
 
-        # Parsear señal
-        signal = bot.parse_signal(message)
-        if not signal:
-            # No responder si el formato es inválido (para evitar spam)
-            logger.info("ℹ️ Mensaje ignorado (no es señal válida)")
-            return
+    # Crear cliente de Telethon
+    client = TelegramClient('trading_session', api_id, api_hash)
 
-        # Ejecutar señal
-        result = bot.execute_signal(signal)
+    await client.start(phone=phone)
+    logger.info("✅ Telethon conectado")
 
-        if result["success"]:
-            if signal["action"] == "open":
-                await update.message.reply_text(
-                    f"✅ Posición abierta\n\n"
-                    f"📊 {signal['symbol']}\n"
-                    f"📈 {signal['side']}\n"
-                    f"🦅 {result.get('exchange', 'N/A')}\n"
-                    f"💰 Margen: ${result.get('margin_used', 0):.2f}\n"
-                    f"📢 Cantidad: {result.get('quantity', 0)}\n"
-                    f"💵 Precio: ${result.get('price', 0):.2f}\n"
-                    f"⚡ Leverage: {result.get('leverage', 0)}x\n\n"
-                    f"🎯 TP: 30%-30%-30%\n"
-                    f"🛑 SL y Trailing activos"
-                )
-            else:
-                await update.message.reply_text(
-                    f"✅ Posición cerrada\n\n"
-                    f"📊 {signal['symbol']}\n"
-                    f"🦅 {result.get('exchange', 'N/A')}"
-                )
-        else:
-            await update.message.reply_text(
-                f"❌ Error\n\n{result.get('error', 'Desconocido')}"
-            )
-    except Exception as e:
-        logger.error(f"❌ Error: {e}")
+    me = await client.get_me()
+    logger.info(f"👤 Conectado como: {me.first_name} (@{me.username})")
+
+    @client.on(events.NewMessage(chats=target_chat_id))
+    async def handler(event):
+        """Maneja todos los mensajes nuevos en el chat"""
         try:
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-        except:
-            pass
+            message = event.message.text
 
+            if not message:
+                return
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /start"""
-    exchanges_info = "\n".join([f"• {ex.name}" for ex in bot.exchanges])
-    if not exchanges_info:
-        exchanges_info = "• Ninguno"
+            # Obtener información del remitente
+            sender = await event.get_sender()
+            sender_name = "Unknown"
+            is_bot = False
 
-    await update.message.reply_text(
-        f"🤖 Bot de Trading - BingX Futuros\n\n"
-        f"📝 Comandos:\n"
-        f"• BUY BTC\n"
-        f"• SELL ETH\n"
-        f"• CLOSE BTC\n\n"
-        f"🦅 Exchanges:\n{exchanges_info}\n\n"
-        f"⚙️ Modo: ISOLATED\n"
-        f"🎯 3 TP (30%-30%-30%)\n"
-        f"🛑 SL y Trailing\n\n"
-        f"📡 Escuchando señales en este chat..."
-    )
+            if sender:
+                sender_name = sender.first_name or "Unknown"
+                is_bot = getattr(sender, 'bot', False)
 
+            logger.info(f"📨 Mensaje de {'🤖 BOT' if is_bot else '👤'} {sender_name}: {message}")
 
-async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /balance"""
-    try:
-        balances = []
-        total = 0.0
+            # Parsear señal
+            signal = bot.parse_signal(message)
 
-        for exchange in bot.exchanges:
-            balance = exchange.get_balance()
-            balances.append(f"{exchange.name}: ${balance:.2f}")
-            total += balance
+            if not signal:
+                logger.info("ℹ️ No es una señal válida")
+                return
 
-        msg = "💰 Balance USDT:\n\n" + "\n".join(balances) + f"\n\n📊 Total: ${total:.2f}"
-        await update.message.reply_text(msg)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+            logger.info(f"🎯 SEÑAL DETECTADA: {signal}")
 
+            # Ejecutar señal
+            result = await bot.execute_signal(signal)
 
-async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /positions"""
-    try:
-        msg = "📊 Posiciones:\n\n"
-        found_any = False
+            if result["success"]:
+                response = f"✅ {signal['action'].upper()} ejecutado: {signal['symbol']}"
+                if signal["action"] == "open":
+                    response += f"\n💰 Margen: ${result.get('margin_used', 0):.2f}"
+            else:
+                response = f"❌ Error: {result.get('error', 'Desconocido')}"
 
-        for exchange in bot.exchanges:
-            positions = exchange.get_open_positions()
-            if positions:
-                found_any = True
-                msg += f"🦅 {exchange.name}:\n"
-                for pos in positions:
-                    symbol = pos.get("symbol", "?")
-                    side = pos.get("positionSide", "?")
-                    qty = pos.get("positionAmt", 0)
-                    pnl = pos.get("unrealizedProfit", 0)
-                    msg += f"  • {symbol} {side}\n"
-                    msg += f"    Qty: {qty} | PnL: ${float(pnl):.2f}\n"
-                msg += "\n"
+            logger.info(response)
 
-        if not found_any:
-            msg = "📭 No hay posiciones abiertas"
+            # Enviar respuesta al chat
+            try:
+                await event.reply(response)
+            except Exception as e:
+                logger.warning(f"No se pudo responder: {e}")
 
-        await update.message.reply_text(msg)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+        except Exception as e:
+            logger.error(f"❌ Error en handler: {e}")
 
+    logger.info("=" * 60)
+    logger.info("🤖 NEPTUNEBOT INICIADO CON TELETHON")
+    logger.info("=" * 60)
+    logger.info(f"🦅 Exchanges: {[ex.name for ex in bot.exchanges]}")
+    logger.info(f"💬 Escuchando en chat ID: {target_chat_id}")
+    logger.info(f"💰 Margen por trade: ${bot.config.get('trading', 'usdt_margin_per_trade', default=5.0)}")
+    logger.info("⚙️ Modo: ISOLATED | 3 TP (30%-30%-30%)")
+    logger.info("📡 Escuchando TODOS los mensajes (incluidos bots)...")
+    logger.info("=" * 60)
 
-def main():
-    """Función principal"""
-    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
-
-    if not telegram_token:
-        logger.error("❌ TELEGRAM_BOT_TOKEN no configurado")
-        return
-
-    if not bot.exchanges:
-        logger.error("❌ No hay exchanges configurados")
-        return
-
-    # Crear aplicación
-    application = Application.builder().token(telegram_token).build()
-
-    # Handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("balance", balance_command))
-    application.add_handler(CommandHandler("positions", positions_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("✅ Bot iniciado - Esperando señales...")
-    logger.info(f"📊 Exchanges: {[ex.name for ex in bot.exchanges]}")
-    logger.info(f"💬 Chat autorizado: {bot.authorized_chat_id}")
-    logger.info("📡 Modo: Recepción desde canal/grupo")
-
-    # Iniciar bot
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Mantener el cliente corriendo
+    await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
