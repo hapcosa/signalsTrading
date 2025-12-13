@@ -12,10 +12,11 @@
       "tp2_percent": 3.5,
       "tp3_percent": 5.0,
       "tp1_distribution": 30,
-      "tp2_distribution": 50,
+      "tp2_distribution": 35,
       "tp3_distribution": 20,
       "default_sl_percent": 1.8,
-      "trailing_stop_percent": 2.0,
+      "trailing_stop_activation_percent": 2.5,
+      "trailing_stop_callback": 1.0,
       "max_open_positions": 5
     },
     "Hernan Paredes": {
@@ -26,10 +27,11 @@
       "tp2_percent": 3.5,
       "tp3_percent": 5.0,
       "tp1_distribution": 30,
-      "tp2_distribution": 50,
+      "tp2_distribution": 35,
       "tp3_distribution": 20,
       "default_sl_percent": 2.0,
-      "trailing_stop_percent": 2.0
+      "trailing_stop_activation_percent": 2.5,
+      "trailing_stop_callback": 1.0
     },
     "Vera Marco Marco Vera": {
       "usdt_margin_per_trade": 5.0,
@@ -39,10 +41,11 @@
       "tp2_percent": 3.5,
       "tp3_percent": 5.0,
       "tp1_distribution": 30,
-      "tp2_distribution": 50,
+      "tp2_distribution": 35,
       "tp3_distribution": 20,
       "default_sl_percent": 2.0,
-      "trailing_stop_percent": 2.0
+      "trailing_stop_activation_percent": 2.5,
+      "trailing_stop_callback": 1.0
     }
   },
   "notifications": {
