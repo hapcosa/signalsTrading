@@ -3,25 +3,47 @@
     "log_level": "INFO",
     "priority_exchange": "bingx"
   },
-  "trading": {
-    "usdt_margin_per_trade": 5.0,
-    "default_leverage": 10,
-    "trailing_stop_percent": 2.0,
-    "trailing_stop_distance": 1.0,
-    "max_open_positions": 5
-  },
-  "take_profit": {
-    "tp1_percent": 2.0,
-    "tp2_percent": 3.5,
-    "tp3_percent": 5.0,
-    "tp1_distribution": 30,
-    "tp2_distribution": 30,
-    "tp3_distribution": 30
-  },
-  "risk_management": {
-    "default_sl_percent": 1.8,
-    "max_position_size_percent": 10,
-    "min_balance_required": 50
+  "users": {
+    "default": {
+      "usdt_margin_per_trade": 5.0,
+      "default_leverage": 10,
+      "min_balance_required": 50,
+      "tp1_percent": 2.0,
+      "tp2_percent": 3.5,
+      "tp3_percent": 5.0,
+      "tp1_distribution": 30,
+      "tp2_distribution": 30,
+      "tp3_distribution": 40,
+      "default_sl_percent": 1.8,
+      "trailing_stop_percent": 2.0,
+      "max_open_positions": 5
+    },
+    "Hernan Paredes": {
+      "usdt_margin_per_trade": 10.0,
+      "default_leverage": 15,
+      "min_balance_required": 100,
+      "tp1_percent": 2.5,
+      "tp2_percent": 4.0,
+      "tp3_percent": 6.0,
+      "tp1_distribution": 30,
+      "tp2_distribution": 30,
+      "tp3_distribution": 40,
+      "default_sl_percent": 2.0,
+      "trailing_stop_percent": 2.5
+    },
+    "Vera Marco Marco Vera": {
+      "usdt_margin_per_trade": 5.0,
+      "default_leverage": 10,
+      "min_balance_required": 50,
+      "tp1_percent": 2.0,
+      "tp2_percent": 3.5,
+      "tp3_percent": 5.0,
+      "tp1_distribution": 30,
+      "tp2_distribution": 30,
+      "tp3_distribution": 40,
+      "default_sl_percent": 1.8,
+      "trailing_stop_percent": 2.0
+    }
   },
   "notifications": {
     "notify_on_open": true,

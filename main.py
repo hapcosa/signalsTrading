@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Bot de Trading Automatizado para BingX - FUTUROS USDT ISOLATED
-Usa Telethon (userbot) para leer mensajes de otros bots en Telegram
+Multi-usuario: cada usuario controla su propia cuenta BingX
 """
 
 import os
@@ -29,14 +29,35 @@ logger = logging.getLogger(__name__)
 
 
 class ConfigManager:
-    """Gestor de configuración JSON"""
+    """Gestor de configuración JSON por usuario"""
 
     def __init__(self, config_path: str = "config.json"):
         with open(config_path, 'r') as f:
             self.config = json.load(f)
 
+    def get_user_config(self, username: str) -> Dict:
+        """Obtiene configuración específica de un usuario"""
+        users = self.config.get("users", {})
+        user_config = users.get(username, users.get("default", {}))
+
+        # Merge con configuración por defecto si existe
+        default_config = users.get("default", {})
+        merged_config = {**default_config, **user_config}
+
+        # Asegurar que existan las distribuciones de TP
+        if "tp1_distribution" not in merged_config:
+            merged_config["tp1_distribution"] = 30
+        if "tp2_distribution" not in merged_config:
+            merged_config["tp2_distribution"] = 30
+        if "tp3_distribution" not in merged_config:
+            merged_config["tp3_distribution"] = 40  # El resto para TP3
+
+        logger.info(
+            f"📋 Config para {username}: margen=${merged_config.get('usdt_margin_per_trade')}, leverage={merged_config.get('default_leverage')}x, TP dist: {merged_config.get('tp1_distribution')}/{merged_config.get('tp2_distribution')}/{merged_config.get('tp3_distribution')}%")
+        return merged_config
+
     def get(self, *keys, default=None):
-        """Obtiene valor de configuración anidada"""
+        """Obtiene valor de configuración global"""
         value = self.config
         for key in keys:
             if isinstance(value, dict):
@@ -219,9 +240,13 @@ class BingXAPI(ExchangeAPI):
 
     def open_position(self, symbol: str, side: str, usdt_amount: float,
                       leverage: int, tp_percent: List[float], sl_percent: float,
-                      trailing_stop_percent: float) -> Dict:
+                      trailing_stop_percent: float, tp_distribution: List[int] = None) -> Dict:
         """Abre posición en futuros USDT ISOLATED"""
         try:
+            # Distribución por defecto si no se especifica
+            if tp_distribution is None:
+                tp_distribution = [30, 30, 40]
+
             self.set_margin_mode(symbol, "ISOLATED")
 
             current_price = self.get_current_price(symbol)
@@ -266,13 +291,15 @@ class BingXAPI(ExchangeAPI):
                 self._set_stop_loss(symbol, side, sl_price, quantity)
                 logger.info(f"   SL: ${sl_price:.2f}")
 
+                # Usar distribución configurable
                 tp_levels = [
-                    {"price": tp_prices[0], "percentage": 30},
-                    {"price": tp_prices[1], "percentage": 30},
-                    {"price": tp_prices[2], "percentage": 30}
+                    {"price": tp_prices[0], "percentage": tp_distribution[0]},
+                    {"price": tp_prices[1], "percentage": tp_distribution[1]},
+                    {"price": tp_prices[2], "percentage": tp_distribution[2]}
                 ]
                 self._set_take_profits(symbol, side, tp_levels, quantity)
-                logger.info(f"   TP1: ${tp_prices[0]:.2f} | TP2: ${tp_prices[1]:.2f} | TP3: ${tp_prices[2]:.2f}")
+                logger.info(
+                    f"   TP1: ${tp_prices[0]:.2f} ({tp_distribution[0]}%) | TP2: ${tp_prices[1]:.2f} ({tp_distribution[1]}%) | TP3: ${tp_prices[2]:.2f} ({tp_distribution[2]}%)")
 
                 self._set_trailing_stop(symbol, side, trailing_stop_percent)
                 logger.info(f"   Trailing: {trailing_stop_percent}%")
@@ -388,39 +415,62 @@ class BingXAPI(ExchangeAPI):
 
 
 class TradingBot:
-    """Bot principal de trading"""
+    """Bot principal de trading multi-usuario"""
 
     def __init__(self, config_path: str = "config.json"):
         self.config = ConfigManager(config_path)
         self.active_positions = {}
-        self.exchanges = []
+        self.user_exchanges = {}  # Map: user_identifier -> exchange
+        self.user_id_to_name = {}  # Map: telegram_id -> user_identifier
 
-        # Cuenta 1 de BingX
-        bingx_key = os.getenv("BINGX_API_KEY")
-        bingx_secret = os.getenv("BINGX_SECRET_KEY")
+        # Usuario 1
+        username1 = os.getenv("TELEGRAM_USERNAME", "").strip().strip("'\"")
+        user1_id = os.getenv("TELEGRAM_USER_ID")  # Nuevo: ID de Telegram
+        bingx_key1 = os.getenv("BINGX_API_KEY")
+        bingx_secret1 = os.getenv("BINGX_SECRET_KEY")
 
-        if bingx_key and bingx_secret:
-            bingx1 = BingXAPI(bingx_key, bingx_secret)
-            bingx1.name = "BingX-1"
+        if username1 and bingx_key1 and bingx_secret1:
+            bingx1 = BingXAPI(bingx_key1, bingx_secret1)
+            bingx1.name = f"BingX-{username1}"
             if bingx1.is_available():
-                self.exchanges.append(bingx1)
-                logger.info("✅ BingX Cuenta 1 inicializada")
+                self.user_exchanges[username1] = bingx1
+                if user1_id:
+                    self.user_id_to_name[int(user1_id)] = username1
+                logger.info(f"✅ BingX para {username1} inicializada (ID: {user1_id})")
+        else:
+            logger.warning(f"⚠️ Usuario 1 no configurado correctamente")
 
-        # Cuenta 2 de BingX
-        bingx2_key = os.getenv("BINGX2_API_KEY")
-        bingx2_secret = os.getenv("BINGX2_SECRET_KEY")
+        # Usuario 2
+        username2 = os.getenv("TELEGRAM_USERNAME2", "").strip().strip("'\"")
+        user2_id = os.getenv("TELEGRAM_USER_ID2")  # Nuevo: ID de Telegram
+        bingx_key2 = os.getenv("BINGX2_API_KEY")
+        bingx_secret2 = os.getenv("BINGX2_SECRET_KEY")
 
-        if bingx2_key and bingx2_secret:
-            bingx2 = BingXAPI(bingx2_key, bingx2_secret)
-            bingx2.name = "BingX-2"
+        if username2 and bingx_key2 and bingx_secret2:
+            bingx2 = BingXAPI(bingx_key2, bingx_secret2)
+            bingx2.name = f"BingX-{username2}"
             if bingx2.is_available():
-                self.exchanges.append(bingx2)
-                logger.info("✅ BingX Cuenta 2 inicializada")
+                self.user_exchanges[username2] = bingx2
+                if user2_id:
+                    self.user_id_to_name[int(user2_id)] = username2
+                logger.info(f"✅ BingX para {username2} inicializada (ID: {user2_id})")
+        else:
+            logger.warning(f"⚠️ Usuario 2 no configurado correctamente")
 
-        if not self.exchanges:
+        if not self.user_exchanges:
             logger.error("❌ No hay exchanges configurados")
 
-    def normalize_symbol(self, symbol: str, exchange: ExchangeAPI) -> str:
+        logger.info(f"👥 Usuarios configurados: {list(self.user_exchanges.keys())}")
+
+    def get_user_exchange(self, user_identifier: str) -> Optional[BingXAPI]:
+        """Obtiene el exchange de un usuario específico"""
+        return self.user_exchanges.get(user_identifier)
+
+    def get_user_identifier_from_telegram_id(self, telegram_id: int) -> Optional[str]:
+        """Obtiene el identificador de usuario desde el Telegram ID"""
+        return self.user_id_to_name.get(telegram_id)
+
+    def normalize_symbol(self, symbol: str) -> str:
         """Normaliza símbolo para BingX: BTC -> BTC-USDT"""
         symbol = symbol.upper().strip()
 
@@ -498,40 +548,67 @@ class TradingBot:
             logger.error(f"Error verificando posición contraria: {e}")
             return None
 
-    async def execute_signal(self, signal: Dict) -> Dict:
-        """Ejecuta la señal"""
+    async def execute_signal_for_all_users(self, signal: Dict) -> List[Dict]:
+        """Ejecuta señal para TODOS los usuarios"""
+        results = []
+
+        for user_identifier, exchange in self.user_exchanges.items():
+            logger.info(f"\n{'=' * 60}")
+            logger.info(f"👤 Ejecutando para {user_identifier}")
+            logger.info(f"{'=' * 60}")
+
+            if signal["action"] == "open":
+                result = await self.open_trade_for_user(signal, user_identifier)
+            elif signal["action"] == "close":
+                result = await self.close_trade_for_user(signal, user_identifier)
+            else:
+                result = {"success": False, "error": "Acción no reconocida", "user_identifier": user_identifier}
+
+            result["user_identifier"] = user_identifier
+            results.append(result)
+
+        return results
+
+    async def execute_signal_for_user(self, signal: Dict, user_identifier: str) -> Dict:
+        """Ejecuta señal para un usuario específico"""
         if signal["action"] == "open":
-            return await self.open_trade(signal)
+            return await self.open_trade_for_user(signal, user_identifier)
         elif signal["action"] == "close":
-            return await self.close_trade(signal)
+            return await self.close_trade_for_user(signal, user_identifier)
         return {"success": False, "error": "Acción no reconocida"}
 
-    async def open_trade(self, signal: Dict) -> Dict:
-        """Abre trade"""
+    async def open_trade_for_user(self, signal: Dict, user_identifier: str) -> Dict:
+        """Abre trade para un usuario específico"""
         try:
-            usdt_amount = self.config.get("trading", "usdt_margin_per_trade", default=5.0)
-            leverage = self.config.get("trading", "default_leverage", default=10)
-            min_balance = self.config.get("risk_management", "min_balance_required", default=50)
+            exchange = self.get_user_exchange(user_identifier)
 
-            if not self.exchanges:
-                return {"success": False, "error": "No hay exchanges configurados"}
+            if not exchange:
+                logger.error(f"❌ No hay exchange para {user_identifier}")
+                return {"success": False, "error": f"Usuario {user_identifier} no configurado"}
 
-            exchange = self.exchanges[0]
+            # Obtener configuración del usuario
+            user_config = self.config.get_user_config(user_identifier)
+
+            usdt_amount = user_config.get("usdt_margin_per_trade", 5.0)
+            leverage = user_config.get("default_leverage", 10)
+            min_balance = user_config.get("min_balance_required", 50)
 
             balance = exchange.get_balance()
+            logger.info(f"💰 Balance de {user_identifier}: ${balance:.2f}")
+
             if balance < min_balance:
                 return {"success": False, "error": f"Balance bajo: ${balance:.2f} (min: ${min_balance})"}
 
-            symbol = self.normalize_symbol(signal["symbol"], exchange)
+            symbol = self.normalize_symbol(signal["symbol"])
             side = signal["side"]
 
             logger.info(f"📊 {signal['symbol']} -> {symbol}")
 
             if self.check_existing_position(exchange, symbol):
-                logger.warning(f"⚠️ Ya existe posición para {symbol}")
+                logger.warning(f"⚠️ {user_identifier} ya tiene posición en {symbol}")
                 return {
                     "success": False,
-                    "error": f"Ya hay posición abierta en {symbol}. Usa CLOSE {signal['symbol']} primero"
+                    "error": f"Ya hay posición abierta en {symbol}"
                 }
 
             opposite_pos = self.check_opposite_position(exchange, symbol, side)
@@ -552,97 +629,168 @@ class TradingBot:
                 await asyncio.sleep(2)
 
             tp_percent = [
-                self.config.get("take_profit", "tp1_percent", default=2.0),
-                self.config.get("take_profit", "tp2_percent", default=3.5),
-                self.config.get("take_profit", "tp3_percent", default=5.0)
+                user_config.get("tp1_percent", 2.0),
+                user_config.get("tp2_percent", 3.5),
+                user_config.get("tp3_percent", 5.0)
             ]
 
-            sl_percent = self.config.get("risk_management", "default_sl_percent", default=1.8)
-            trailing_stop = self.config.get("trading", "trailing_stop_percent", default=2.0)
+            tp_distribution = [
+                user_config.get("tp1_distribution", 30),
+                user_config.get("tp2_distribution", 30),
+                user_config.get("tp3_distribution", 40)
+            ]
 
-            logger.info(f"🚀 Abriendo {side} en {symbol}")
+            sl_percent = user_config.get("default_sl_percent", 1.8)
+            trailing_stop = user_config.get("trailing_stop_percent", 2.0)
+
+            logger.info(f"🚀 Abriendo {side} en {symbol} para {user_identifier}")
+            logger.info(f"   💰 Margen: ${usdt_amount} | ⚡ Leverage: {leverage}x")
 
             result = exchange.open_position(
                 symbol, side, usdt_amount, leverage,
-                tp_percent, sl_percent, trailing_stop
+                tp_percent, sl_percent, trailing_stop, tp_distribution
             )
 
             if result["success"]:
-                self.active_positions[f"{exchange.name}_{symbol}"] = {
+                self.active_positions[f"{user_identifier}_{symbol}"] = {
                     "order_id": result["order_id"],
                     "side": side,
                     "symbol": symbol,
                     "exchange": exchange.name,
+                    "user_identifier": user_identifier,
                     "timestamp": datetime.now().isoformat()
                 }
 
             return result
         except Exception as e:
-            logger.error(f"❌ Error abriendo trade: {e}")
+            logger.error(f"❌ Error abriendo trade para {user_identifier}: {e}")
             return {"success": False, "error": str(e)}
 
-    async def close_trade(self, signal: Dict) -> Dict:
-        """Cierra trade en todas las cuentas"""
+    async def close_trade_for_user(self, signal: Dict, user_identifier: str) -> Dict:
+        """Cierra trade para un usuario específico"""
         try:
-            symbol_raw = signal["symbol"]
-            results = []
-            all_success = True
+            exchange = self.get_user_exchange(user_identifier)
 
-            for exchange in self.exchanges:
-                logger.info(f"\n{'=' * 50}")
-                logger.info(f"🎯 Cerrando en {exchange.name}")
-                logger.info(f"{'=' * 50}")
+            if not exchange:
+                logger.error(f"❌ No hay exchange para {user_identifier}")
+                return {"success": False, "error": f"Usuario {user_identifier} no configurado"}
 
-                symbol = self.normalize_symbol(symbol_raw, exchange)
+            symbol = self.normalize_symbol(signal["symbol"])
 
-                if not self.check_existing_position(exchange, symbol):
-                    logger.info(f"ℹ️ {exchange.name}: No hay posición abierta para {symbol}")
-                    results.append({
-                        "exchange": exchange.name,
-                        "success": False,
-                        "error": "No hay posición abierta"
-                    })
-                    continue
+            if not self.check_existing_position(exchange, symbol):
+                logger.info(f"ℹ️ {user_identifier}: No hay posición abierta para {symbol}")
+                return {
+                    "success": False,
+                    "error": "No hay posición abierta"
+                }
 
-                logger.info(f"🔴 Cerrando {symbol}")
+            logger.info(f"🔴 Cerrando {symbol} para {user_identifier}")
 
-                result = exchange.close_position(symbol)
+            result = exchange.close_position(symbol)
 
-                if result["success"]:
-                    key = f"{exchange.name}_{symbol}"
-                    if key in self.active_positions:
-                        del self.active_positions[key]
+            if result["success"]:
+                key = f"{user_identifier}_{symbol}"
+                if key in self.active_positions:
+                    del self.active_positions[key]
 
-                    results.append({
-                        "exchange": exchange.name,
-                        "success": True
-                    })
-                else:
-                    all_success = False
-                    results.append({
-                        "exchange": exchange.name,
-                        "success": False,
-                        "error": result.get("error", "Error desconocido")
-                    })
-
-            if not results:
-                return {"success": False, "error": "No se encontraron posiciones en ninguna cuenta"}
-
-            return {
-                "success": all_success,
-                "multi_account": True,
-                "results": results,
-                "total_accounts": len(self.exchanges),
-                "closed_accounts": sum(1 for r in results if r.get("success"))
-            }
+            return result
 
         except Exception as e:
-            logger.error(f"❌ Error cerrando: {e}")
+            logger.error(f"❌ Error cerrando para {user_identifier}: {e}")
             return {"success": False, "error": str(e)}
 
 
 # Instancia global del bot
 bot = TradingBot()
+
+
+# ============================================================================
+# COMANDOS
+# ============================================================================
+
+async def handle_command(event, sender_id: int):
+    """Maneja comandos de Telegram"""
+    try:
+        message = event.message.text.strip()
+        command = message.split()[0].lower()
+
+        # Obtener user_identifier desde el Telegram ID
+        user_identifier = bot.get_user_identifier_from_telegram_id(sender_id)
+
+        if not user_identifier:
+            await event.reply(
+                f"❌ Tu cuenta de Telegram (ID: {sender_id}) no está configurada. Contacta al administrador.")
+            return
+
+        if command == "/balance":
+            exchange = bot.get_user_exchange(user_identifier)
+            if not exchange:
+                await event.reply(f"❌ {user_identifier} no está configurado")
+                return
+
+            balance = exchange.get_balance()
+            await event.reply(f"💰 Balance {user_identifier}: ${balance:.2f} USDT")
+
+        elif command == "/positions":
+            exchange = bot.get_user_exchange(user_identifier)
+            if not exchange:
+                await event.reply(f"❌ {user_identifier} no está configurado")
+                return
+
+            positions = exchange.get_open_positions()
+            if not positions:
+                await event.reply(f"📭 {user_identifier}: Sin posiciones abiertas")
+                return
+
+            msg = f"📊 Posiciones de {user_identifier}:\n\n"
+            for pos in positions:
+                symbol = pos.get("symbol", "?")
+                side = pos.get("positionSide", "?")
+                qty = pos.get("positionAmt", 0)
+                pnl = pos.get("unrealizedProfit", 0)
+                msg += f"• {symbol} {side}\n"
+                msg += f"  Qty: {qty} | PnL: ${float(pnl):.2f}\n"
+
+            await event.reply(msg)
+
+        elif command == "/close":
+            parts = message.split()
+            if len(parts) < 2:
+                await event.reply("❌ Uso: /close SYMBOL\nEjemplo: /close BTC")
+                return
+
+            symbol_input = parts[1]
+            signal = {"action": "close", "symbol": symbol_input}
+
+            # Solo cerrar para el usuario que ejecutó el comando
+            result = await bot.close_trade_for_user(signal, user_identifier)
+
+            if result["success"]:
+                await event.reply(f"✅ Posición cerrada: {symbol_input} (solo tu cuenta)")
+            else:
+                await event.reply(f"❌ Error: {result.get('error')}")
+
+        elif command == "/help":
+            help_text = f"""
+🤖 NeptuneBot - Comandos
+
+👤 Tu cuenta: {user_identifier}
+
+/balance - Ver tu balance
+/positions - Ver tus posiciones
+/close SYMBOL - Cerrar posición
+/help - Este mensaje
+
+Señales automáticas:
+• BUY BTC - Abre LONG
+• SELL ETH - Abre SHORT
+• CLOSE BTC - Cierra posición
+"""
+            await event.reply(help_text)
+
+    except Exception as e:
+        logger.error(f"Error en comando: {e}")
+        await event.reply(f"❌ Error: {str(e)}")
 
 
 # ============================================================================
@@ -652,10 +800,10 @@ bot = TradingBot()
 async def main():
     """Función principal con Telethon"""
 
-    # Credenciales de Telegram API (debes obtenerlas de https://my.telegram.org)
+    # Credenciales de Telegram API
     api_id = int(os.getenv("TELEGRAM_API_ID"))
     api_hash = os.getenv("TELEGRAM_API_HASH")
-    phone = os.getenv("TELEGRAM_PHONE")  # Tu número de teléfono
+    phone = os.getenv("TELEGRAM_PHONE")
 
     # Chat/grupo donde escuchar
     target_chat_id = int(os.getenv("TELEGRAM_CHAT_ID"))
@@ -681,13 +829,21 @@ async def main():
             # Obtener información del remitente
             sender = await event.get_sender()
             sender_name = "Unknown"
+            sender_id = None
             is_bot = False
 
             if sender:
                 sender_name = sender.first_name or "Unknown"
+                sender_id = sender.id
                 is_bot = getattr(sender, 'bot', False)
 
-            logger.info(f"📨 Mensaje de {'🤖 BOT' if is_bot else '👤'} {sender_name}: {message}")
+            logger.info(f"📨 Mensaje de {'🤖 BOT' if is_bot else '👤'} {sender_name} (ID: {sender_id}): {message}")
+
+            # Si es un comando (empieza con /)
+            if message.startswith("/"):
+                if sender_id:
+                    await handle_command(event, sender_id)
+                return
 
             # Parsear señal
             signal = bot.parse_signal(message)
@@ -696,17 +852,37 @@ async def main():
                 logger.info("ℹ️ No es una señal válida")
                 return
 
-            logger.info(f"🎯 SEÑAL DETECTADA: {signal}")
+            # 🔒 SEGURIDAD: Solo aceptar señales de BOTS
+            if not is_bot:
+                logger.warning(f"⚠️ Señal ignorada: viene de usuario {sender_name} (ID: {sender_id}), no de un bot")
+                logger.info("💡 Las señales automáticas solo pueden venir de bots de Telegram")
+                return
 
-            # Ejecutar señal
-            result = await bot.execute_signal(signal)
+            logger.info(f"🎯 SEÑAL DETECTADA (de BOT): {signal}")
 
-            if result["success"]:
-                response = f"✅ {signal['action'].upper()} ejecutado: {signal['symbol']}"
-                if signal["action"] == "open":
-                    response += f"\n💰 Margen: ${result.get('margin_used', 0):.2f}"
+            # Ejecutar señal para TODOS los usuarios
+            results = await bot.execute_signal_for_all_users(signal)
+
+            # Construir respuesta
+            success_count = sum(1 for r in results if r.get("success"))
+            total_count = len(results)
+
+            if success_count == total_count:
+                response = f"✅ {signal['action'].upper()} ejecutado en {success_count}/{total_count} cuentas: {signal['symbol']}\n"
+                for r in results:
+                    user_id = r.get('user_identifier', 'Unknown')
+                    if signal["action"] == "open":
+                        response += f"• {user_id}: ${r.get('margin_used', 0):.2f}\n"
+                    else:
+                        response += f"• {user_id}: ✓\n"
             else:
-                response = f"❌ Error: {result.get('error', 'Desconocido')}"
+                response = f"⚠️ {signal['action'].upper()} ejecutado en {success_count}/{total_count} cuentas: {signal['symbol']}\n"
+                for r in results:
+                    user_id = r.get('user_identifier', 'Unknown')
+                    if r.get("success"):
+                        response += f"• {user_id}: ✅\n"
+                    else:
+                        response += f"• {user_id}: ❌ {r.get('error', 'Error')}\n"
 
             logger.info(response)
 
@@ -722,10 +898,8 @@ async def main():
     logger.info("=" * 60)
     logger.info("🤖 NEPTUNEBOT INICIADO CON TELETHON")
     logger.info("=" * 60)
-    logger.info(f"🦅 Exchanges: {[ex.name for ex in bot.exchanges]}")
+    logger.info(f"👥 Usuarios: {list(bot.user_exchanges.keys())}")
     logger.info(f"💬 Escuchando en chat ID: {target_chat_id}")
-    logger.info(f"💰 Margen por trade: ${bot.config.get('trading', 'usdt_margin_per_trade', default=5.0)}")
-    logger.info("⚙️ Modo: ISOLATED | 3 TP (30%-30%-30%)")
     logger.info("📡 Escuchando TODOS los mensajes (incluidos bots)...")
     logger.info("=" * 60)
 
