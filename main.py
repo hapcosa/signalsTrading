@@ -66,8 +66,8 @@ class ConfigManager:
             f"📋 Config {username}: margen=${merged_config.get('usdt_margin_per_trade')}, "
             f"leverage={merged_config.get('default_leverage')}x, "
             f"TP: {merged_config.get('tp1_distribution')}/{merged_config.get('tp2_distribution')}/{merged_config.get('tp3_distribution')}% "
-            f"(15% para trailing), trailing activa: +{merged_config.get('trailing_stop_activation_percent')}%, "
-            f"callback={merged_config.get('trailing_stop_callback')}%")
+            f"en +{merged_config.get('tp1_percent')}/{merged_config.get('tp2_percent')}/{merged_config.get('tp3_percent')}%, "
+            f"trailing: +{merged_config.get('trailing_stop_activation_percent')}%, callback={merged_config.get('trailing_stop_callback')}%")
         return merged_config
 
     def get(self, *keys, default=None):
@@ -207,6 +207,38 @@ class BingXAPI:
             logger.error(f"Error obteniendo contrato: {e}")
             return {}
 
+    def calculate_tp_quantity_from_usdt(self, total_quantity: float, entry_price: float,
+                                        tp_price: float, usdt_target: float, leverage: int) -> float:
+        """Calcula la cantidad para un TP basado en valor USDT objetivo
+
+        Args:
+            total_quantity: Cantidad total de la posición
+            entry_price: Precio de entrada
+            tp_price: Precio del take profit
+            usdt_target: Valor en USDT que quieres ganar con este TP
+            leverage: Apalancamiento usado
+
+        Returns:
+            Cantidad de monedas para el TP
+        """
+        try:
+            # Ganancia por unidad = diferencia de precio
+            profit_per_unit = abs(tp_price - entry_price)
+
+            # Cantidad necesaria para alcanzar el objetivo USDT
+            # usdt_target = quantity * profit_per_unit
+            quantity_needed = usdt_target / profit_per_unit
+
+            # No puede exceder la cantidad total
+            if quantity_needed > total_quantity:
+                quantity_needed = total_quantity
+
+            return quantity_needed
+
+        except Exception as e:
+            logger.error(f"Error calculando TP quantity desde USDT: {e}")
+            return 0.0
+
     def calculate_position_size(self, symbol: str, usdt_amount: float, leverage: int, current_price: float) -> float:
         """Calcula tamaño de posición"""
         try:
@@ -266,16 +298,17 @@ class BingXAPI:
             return False
 
     def set_take_profit(self, symbol: str, side: str, price: float, quantity: float, tp_num: int) -> bool:
-        """Configura un Take Profit"""
+        """Configura un Take Profit usando orden LIMIT (sin reduceOnly en Hedge Mode)"""
         try:
             endpoint = "/openApi/swap/v2/trade/order"
             params = {
                 "symbol": symbol,
                 "side": "SELL" if side == "BUY" else "BUY",
                 "positionSide": "LONG" if side == "BUY" else "SHORT",
-                "type": "TAKE_PROFIT_MARKET",
-                "stopPrice": price,
+                "type": "LIMIT",
+                "price": price,
                 "quantity": quantity,
+                # NO usar reduceOnly en Hedge Mode - BingX lo rechaza
                 "timestamp": int(time.time() * 1000)
             }
             response = self._make_request("POST", endpoint, params)
@@ -288,23 +321,34 @@ class BingXAPI:
             logger.error(f"Error configurando TP{tp_num}: {e}")
             return False
 
-    def set_trailing_stop(self, symbol: str, side: str, callback_rate: float, activation_price: float) -> bool:
-        """Configura Trailing Stop con precio de activación y callback rate"""
+    def set_trailing_stop(self, symbol: str, side: str, callback_rate: float, activation_price: float,
+                          position_quantity: float) -> bool:
+        """Configura Trailing Stop con precio de activación y callback rate
+
+        IMPORTANTE: callback_rate debe estar en formato decimal
+        Ejemplo: 1.2% debe pasarse como 1.2, y se convierte a 0.012 internamente
+        """
         try:
             endpoint = "/openApi/swap/v2/trade/order"
+
+            # BingX requiere priceRate en formato decimal (1.2% = 0.012, no 1.2)
+            price_rate_decimal = callback_rate / 100
+
             params = {
                 "symbol": symbol,
                 "side": "SELL" if side == "BUY" else "BUY",
                 "positionSide": "LONG" if side == "BUY" else "SHORT",
                 "type": "TRAILING_STOP_MARKET",
-                "activationPrice": activation_price,  # Precio donde se activa el trailing
-                "callbackRate": callback_rate,  # % de retroceso para cerrar
+                "stopPrice": activation_price,  # Precio donde se activa el trailing
+                "priceRate": price_rate_decimal,  # % de retroceso en formato decimal (debe ser ≤ 1)
+                "quantity": position_quantity,  # Cantidad total restante
                 "timestamp": int(time.time() * 1000)
             }
 
             response = self._make_request("POST", endpoint, params)
             if response and response.get("code") == 0:
-                logger.info(f"✅ Trailing Stop: activa en ${activation_price:.4f}, callback {callback_rate}%")
+                logger.info(
+                    f"✅ Trailing Stop: activa en ${activation_price:.4f}, callback {callback_rate}% ({price_rate_decimal}), qty={position_quantity}")
                 return True
             logger.warning(f"⚠️ Error en Trailing: {response}")
             return False
@@ -316,7 +360,11 @@ class BingXAPI:
                       tp_percent: List[float], sl_percent: float,
                       trailing_activation_percent: float, trailing_callback: float,
                       tp_distribution: List[int]) -> Dict:
-        """Abre posición con TP parciales (85%) y trailing stop (15%)"""
+        """Abre posición con TP parciales y trailing stop
+
+        Los TPs se configuran basándose en el valor USDT calculado desde los porcentajes.
+        Esto evita problemas con cantidades mínimas del contrato.
+        """
         try:
             self.set_margin_mode(symbol, "ISOLATED")
 
@@ -330,7 +378,7 @@ class BingXAPI:
 
             self._set_leverage(symbol, leverage)
 
-            # Calcular precios
+            # Calcular precios de TP, SL y Trailing
             if side == "BUY":
                 tp_prices = [current_price * (1 + tp / 100) for tp in tp_percent]
                 sl_price = current_price * (1 - sl_percent / 100)
@@ -372,23 +420,111 @@ class BingXAPI:
             if not sl_success:
                 logger.warning("⚠️ SL no se pudo configurar, se reintentará en el monitor")
 
-            # Configurar TPs (solo 85% del total)
+            # Obtener info del contrato
+            contract_info = self.get_contract_info(symbol)
+            min_qty = float(contract_info.get("minQty", 0))
+            qty_precision = int(contract_info.get("quantityPrecision", 0))
+
+            # Calcular valor de posición total en USDT
+            position_value_usdt = usdt_amount * leverage
+
+            # NO usar qty_precision si es 0, usar 8 decimales (estándar crypto)
+            precision_to_use = max(qty_precision, 8) if qty_precision > 0 else 8
+
+            logger.info(
+                f"   💰 Valor posición: ${position_value_usdt:.2f} USDT (precision: {precision_to_use} decimales)")
+
+            # Configurar TPs basados en porcentajes → convertir a valores USDT
             tp_success_count = 0
-            for i, (tp_price, distribution) in enumerate(zip(tp_prices, tp_distribution), 1):
-                tp_quantity = round(quantity * (distribution / 100), 8)
-                if tp_quantity > 0:
+            total_tp_quantity = 0
+
+            logger.info(f"   📊 TPs: {tp_distribution[0]}% (≈${position_value_usdt * tp_distribution[0] / 100:.2f}), "
+                        f"{tp_distribution[1]}% (≈${position_value_usdt * tp_distribution[1] / 100:.2f}), "
+                        f"{tp_distribution[2]}% (≈${position_value_usdt * tp_distribution[2] / 100:.2f})")
+
+            for i, (tp_price, distribution, tp_pct) in enumerate(zip(tp_prices, tp_distribution, tp_percent), 1):
+                # Calcular cuánto USDT queremos ganar con este TP (basado en el % de distribución)
+                # Por ejemplo: 30% de la posición con 2% de ganancia
+                tp_position_value = position_value_usdt * (distribution / 100)
+                tp_profit_usdt = tp_position_value * (tp_pct / 100)
+
+                # Calcular cantidad necesaria para alcanzar ese profit en USDT
+                tp_quantity = self.calculate_tp_quantity_from_usdt(
+                    quantity - total_tp_quantity,
+                    current_price,
+                    tp_price,
+                    tp_profit_usdt,
+                    leverage
+                )
+
+                tp_quantity = round(tp_quantity, precision_to_use)
+
+                # Verificar mínimo (usar un mínimo razonable si min_qty es 0)
+                effective_min_qty = min_qty if min_qty > 0 else 0.0001
+                if tp_quantity < effective_min_qty:
+                    logger.warning(f"⚠️ TP{i} qty={tp_quantity} < min={effective_min_qty}, ajustando")
+                    tp_quantity = effective_min_qty
+
+                # Verificar que no exceda lo disponible
+                remaining_qty = quantity - total_tp_quantity
+                if tp_quantity > remaining_qty:
+                    tp_quantity = remaining_qty
+
+                if tp_quantity >= effective_min_qty and tp_quantity > 0:
                     if self.set_take_profit(symbol, side, tp_price, tp_quantity, i):
+                        # Calcular ganancia real en USDT
+                        profit_per_unit = abs(tp_price - current_price)
+                        actual_profit_usdt = profit_per_unit * tp_quantity
+
                         tp_success_count += 1
+                        total_tp_quantity += tp_quantity
+                        logger.info(f"   💵 TP{i}: {tp_quantity} unidades → ${actual_profit_usdt:.2f} USDT de ganancia")
                     time.sleep(0.5)
+                else:
+                    logger.warning(f"⚠️ TP{i} omitido: qty={tp_quantity} inválida")
 
-            logger.info(f"   TPs configurados: {tp_success_count}/3")
+            logger.info(f"   TPs configurados: {tp_success_count}/3 (total qty: {total_tp_quantity}/{quantity})")
 
-            # Configurar Trailing Stop con precio de activación
-            trailing_success = self.set_trailing_stop(
-                symbol, side, trailing_callback, trailing_activation_price
-            )
-            if not trailing_success:
-                logger.warning("⚠️ Trailing no se pudo configurar, se reintentará en el monitor")
+            # Calcular cantidad restante para trailing stop
+            trailing_quantity = round(quantity - total_tp_quantity, precision_to_use)
+
+            # Calcular valor USDT objetivo para el trailing (basado en el % restante, típicamente 15%)
+            trailing_distribution_pct = 100 - sum(tp_distribution)
+            trailing_position_value = position_value_usdt * (trailing_distribution_pct / 100)
+            trailing_profit_usdt = trailing_position_value * (trailing_activation_percent / 100)
+
+            logger.info(f"   🎯 Trailing: {trailing_distribution_pct}% restante "
+                        f"(≈${trailing_position_value:.2f}) → objetivo ${trailing_profit_usdt:.2f} USDT")
+
+            effective_min_qty = min_qty if min_qty > 0 else 0.0001
+            if trailing_quantity < effective_min_qty:
+                logger.warning(f"⚠️ Trailing qty={trailing_quantity} < min={effective_min_qty}, ajustando")
+                trailing_quantity = effective_min_qty
+
+            # Configurar Trailing Stop
+            trailing_success = False
+            if trailing_quantity > 0 and trailing_quantity <= (quantity - total_tp_quantity + 0.01):
+                trailing_success = self.set_trailing_stop(
+                    symbol, side, trailing_callback, trailing_activation_price, trailing_quantity
+                )
+                if trailing_success:
+                    # Calcular ganancia potencial del trailing
+                    profit_per_unit_trailing = abs(trailing_activation_price - current_price)
+                    potential_trailing_profit = profit_per_unit_trailing * trailing_quantity
+                    logger.info(f"   💰 Trailing potencial: ${potential_trailing_profit:.2f} USDT al activarse")
+                else:
+                    logger.warning("⚠️ Trailing no se pudo configurar, se reintentará en el monitor")
+            else:
+                logger.warning("⚠️ No queda cantidad válida para trailing stop")
+
+            # Calcular ganancia total potencial
+            total_potential_profit = sum([
+                abs(tp_price - current_price) * round(quantity * (dist / 100), precision_to_use)
+                for tp_price, dist in zip(tp_prices[:tp_success_count], tp_distribution[:tp_success_count])
+            ])
+
+            logger.info(f"   💎 Ganancia total potencial TPs: ${total_potential_profit:.2f} USDT")
+            logger.info(f"   📈 ROI potencial: {(total_potential_profit / usdt_amount) * 100:.1f}%")
 
             return {
                 "success": True,
@@ -401,6 +537,8 @@ class BingXAPI:
                 "tp_count": tp_success_count,
                 "trailing_set": trailing_success,
                 "trailing_activation": trailing_activation_price,
+                "trailing_quantity": trailing_quantity,
+                "potential_profit_usdt": total_potential_profit,
                 "exchange": "BingX"
             }
 
@@ -446,6 +584,7 @@ class PositionMonitor:
         self.bot = bot
         self.is_running = False
         self.check_interval = 30  # segundos
+        self.failed_positions = {}  # Guarda posiciones que dan error para no reintentarlas constantemente
 
     async def start(self):
         """Inicia el monitor"""
@@ -466,6 +605,16 @@ class PositionMonitor:
             try:
                 positions = exchange.get_open_positions()
 
+                if positions:
+                    logger.info(f"🔍 {user_id}: Detectadas {len(positions)} posición(es)")
+                    for pos in positions:
+                        symbol = pos.get("symbol", "?")
+                        side = pos.get("positionSide", "?")
+                        qty = pos.get("positionAmt", 0)
+                        logger.info(f"   📍 {symbol} {side} qty={qty}")
+                else:
+                    logger.debug(f"🔍 {user_id}: Sin posiciones abiertas")
+
                 for pos in positions:
                     await self.verify_position_orders(user_id, exchange, pos)
 
@@ -483,6 +632,14 @@ class PositionMonitor:
             if quantity == 0 or entry_price == 0:
                 return
 
+            # Crear ID único para la posición
+            position_id = f"{user_id}_{symbol}_{side}"
+
+            # Si esta posición ha fallado 3+ veces, saltarla
+            if position_id in self.failed_positions and self.failed_positions[position_id] >= 3:
+                logger.debug(f"⏭️ Saltando {position_id} (demasiados errores previos)")
+                return
+
             # Obtener órdenes abiertas
             orders = exchange.get_open_orders(symbol)
 
@@ -490,18 +647,35 @@ class PositionMonitor:
             has_sl = False
             tp_count = 0
             has_trailing = False
+            total_tp_quantity = 0
 
             for order in orders:
                 order_type = order.get("type", "")
+                order_side = order.get("side", "")
+                position_side = order.get("positionSide", "")
+
                 if order_type == "STOP_MARKET":
                     has_sl = True
-                elif order_type == "TAKE_PROFIT_MARKET":
-                    tp_count += 1
+                elif order_type == "LIMIT":
+                    # Las órdenes LIMIT que cierran la posición son nuestros TPs
+                    # En LONG: TP es SELL, en SHORT: TP es BUY
+                    is_closing_order = (
+                            (side == "LONG" and order_side == "SELL" and position_side == "LONG") or
+                            (side == "SHORT" and order_side == "BUY" and position_side == "SHORT")
+                    )
+                    if is_closing_order:
+                        tp_count += 1
+                        total_tp_quantity += abs(float(order.get("quantity", 0)))
                 elif order_type == "TRAILING_STOP_MARKET":
                     has_trailing = True
 
             # Obtener configuración del usuario
             user_config = self.bot.config.get_user_config(user_id)
+
+            # Obtener info del contrato
+            contract_info = exchange.get_contract_info(symbol)
+            min_qty = float(contract_info.get("minQty", 0))
+            qty_precision = int(contract_info.get("quantityPrecision", 0))
 
             # Verificar y corregir SL
             if not has_sl:
@@ -510,10 +684,10 @@ class PositionMonitor:
 
                 if side == "LONG":
                     sl_price = entry_price * (1 - sl_percent / 100)
-                    order_side = "BUY"
+                    order_side = "SELL"  # Para cerrar posición LONG
                 else:
                     sl_price = entry_price * (1 + sl_percent / 100)
-                    order_side = "SELL"
+                    order_side = "BUY"  # Para cerrar posición SHORT
 
                 exchange.set_stop_loss(symbol, order_side, sl_price, abs(quantity))
 
@@ -535,16 +709,74 @@ class PositionMonitor:
 
                 if side == "LONG":
                     tp_prices = [entry_price * (1 + tp / 100) for tp in tp_percents]
-                    order_side = "BUY"
+                    order_side = "SELL"  # Para cerrar posición LONG
                 else:
                     tp_prices = [entry_price * (1 - tp / 100) for tp in tp_percents]
-                    order_side = "SELL"
+                    order_side = "BUY"  # Para cerrar posición SHORT
 
-                # Configurar TPs faltantes
+                # Calcular valor de posición en USDT para usar el mismo sistema que open_position
+                usdt_margin = user_config.get("usdt_margin_per_trade", 5.0)
+                leverage = user_config.get("default_leverage", 10)
+                position_value_usdt = usdt_margin * leverage
+
+                remaining_for_tps = abs(quantity) - total_tp_quantity
+
+                logger.info(
+                    f"   💡 Configurando TPs faltantes: entry=${entry_price:.4f}, qty={abs(quantity)}, remaining={remaining_for_tps}")
+                logger.info(f"   💰 Valor posición estimado: ${position_value_usdt:.2f} USDT")
+
                 for i in range(tp_count, 3):
-                    tp_qty = abs(quantity) * (tp_distributions[i] / 100)
-                    exchange.set_take_profit(symbol, order_side, tp_prices[i], tp_qty, i + 1)
-                    await asyncio.sleep(0.5)
+                    # Calcular usando el mismo sistema que open_position (basado en USDT)
+                    tp_position_value = position_value_usdt * (tp_distributions[i] / 100)
+                    tp_profit_usdt = tp_position_value * (tp_percents[i] / 100)
+
+                    # Calcular cantidad necesaria para alcanzar ese profit en USDT
+                    profit_per_unit = abs(tp_prices[i] - entry_price)
+
+                    if profit_per_unit > 0:
+                        tp_qty = tp_profit_usdt / profit_per_unit
+                    else:
+                        tp_qty = 0
+
+                    # NO usar qty_precision del contrato ya que puede ser 0
+                    # Usar máximo 8 decimales (estándar en crypto) o el del contrato si es mayor
+                    precision_to_use = max(qty_precision, 8) if qty_precision > 0 else 8
+                    tp_qty = round(tp_qty, precision_to_use)
+
+                    logger.info(
+                        f"   🔍 TP{i + 1}: qty={tp_qty} (precision={precision_to_use}) → ${tp_profit_usdt:.2f} USDT")
+
+                    # Verificar mínimo
+                    if min_qty > 0 and tp_qty < min_qty:
+                        logger.warning(f"⚠️ {user_id} - {symbol}: TP{i + 1} qty={tp_qty} < min={min_qty}, ajustando")
+                        tp_qty = min_qty
+
+                    # Verificar que no exceda la cantidad restante
+                    if tp_qty > remaining_for_tps:
+                        tp_qty = remaining_for_tps
+
+                    # Verificar que sea una cantidad válida (usar un mínimo razonable)
+                    min_valid_qty = min_qty if min_qty > 0 else 0.0001
+
+                    if tp_qty >= min_valid_qty and tp_qty > 0 and remaining_for_tps > 0:
+                        success = exchange.set_take_profit(symbol, order_side, tp_prices[i], tp_qty, i + 1)
+                        if success:
+                            total_tp_quantity += tp_qty
+                            remaining_for_tps -= tp_qty
+                            logger.info(f"   ✅ TP{i + 1} configurado exitosamente")
+                            # Reset contador de errores si tuvo éxito
+                            if position_id in self.failed_positions:
+                                del self.failed_positions[position_id]
+                        else:
+                            # Incrementar contador de errores
+                            self.failed_positions[position_id] = self.failed_positions.get(position_id, 0) + 1
+                            if self.failed_positions[position_id] >= 3:
+                                logger.warning(
+                                    f"⚠️ {position_id}: Demasiados errores, será ignorada en próximas verificaciones")
+                        await asyncio.sleep(0.5)
+                    else:
+                        logger.warning(
+                            f"⚠️ {user_id} - {symbol}: TP{i + 1} omitido - qty={tp_qty}, min_valid={min_valid_qty}, remaining={remaining_for_tps}")
 
             # Verificar y corregir Trailing Stop
             if not has_trailing:
@@ -556,12 +788,25 @@ class PositionMonitor:
                 # Calcular precio de activación
                 if side == "LONG":
                     trailing_activation_price = entry_price * (1 + trailing_activation_percent / 100)
-                    order_side = "BUY"
+                    order_side = "SELL"  # Para cerrar posición LONG
                 else:
                     trailing_activation_price = entry_price * (1 - trailing_activation_percent / 100)
-                    order_side = "SELL"
+                    order_side = "BUY"  # Para cerrar posición SHORT
 
-                exchange.set_trailing_stop(symbol, order_side, trailing_callback, trailing_activation_price)
+                # Calcular cantidad restante para trailing
+                trailing_quantity = round(abs(quantity) - total_tp_quantity, qty_precision)
+
+                if trailing_quantity < min_qty:
+                    logger.warning(
+                        f"⚠️ {user_id} - {symbol}: Trailing qty={trailing_quantity} < min={min_qty}, ajustando")
+                    trailing_quantity = min_qty
+
+                if trailing_quantity > 0 and trailing_quantity <= abs(quantity):
+                    exchange.set_trailing_stop(symbol, order_side, trailing_callback, trailing_activation_price,
+                                               trailing_quantity)
+                else:
+                    logger.warning(
+                        f"⚠️ {user_id} - {symbol}: No hay cantidad válida para trailing ({trailing_quantity})")
 
         except Exception as e:
             logger.error(f"Error verificando órdenes de {symbol}: {e}")
@@ -709,10 +954,31 @@ class TradingBot:
             # Verificar posición existente
             positions = exchange.get_open_positions(symbol)
             if positions:
-                logger.warning(f"⚠️ Ya hay posición en {symbol}")
-                return {"success": False, "error": "Posición existente"}
+                # Verificar si la posición es en la MISMA dirección o CONTRARIA
+                existing_pos = positions[0]
+                existing_side = existing_pos.get("positionSide")  # LONG o SHORT
+                new_side = "LONG" if side == "BUY" else "SHORT"
 
-            # Configuración TP/SL
+                if existing_side == new_side:
+                    # Misma dirección - no abrir otra
+                    logger.warning(f"⚠️ Ya hay posición {existing_side} en {symbol}")
+                    return {"success": False, "error": f"Posición {existing_side} existente"}
+                else:
+                    # Dirección CONTRARIA - cerrar la actual y abrir la nueva
+                    logger.warning(
+                        f"🔄 Posición {existing_side} detectada en {symbol}, cerrando para abrir {new_side}...")
+
+                    # Cerrar posición actual
+                    close_result = exchange.close_position(symbol)
+                    if close_result["success"]:
+                        logger.info(f"✅ Posición {existing_side} cerrada exitosamente")
+                        # Esperar un momento para que BingX procese el cierre
+                        await asyncio.sleep(2)
+                    else:
+                        logger.error(f"❌ Error cerrando posición {existing_side}: {close_result.get('error')}")
+                        return {"success": False, "error": f"No se pudo cerrar posición {existing_side}"}
+
+            # Configuración TP/SL desde config
             tp_percent = [
                 user_config.get("tp1_percent", 2.0),
                 user_config.get("tp2_percent", 3.5),
@@ -731,8 +997,10 @@ class TradingBot:
 
             logger.info(f"🚀 Abriendo {side} en {symbol}")
             logger.info(f"   💰 Margen: ${usdt_amount} | ⚡ Leverage: {leverage}x")
+            logger.info(f"   📊 TPs en: +{tp_percent[0]}%, +{tp_percent[1]}%, +{tp_percent[2]}%")
             logger.info(f"   📈 Trailing activa: +{trailing_activation_percent}%, callback: {trailing_callback}%")
 
+            # El cálculo de USDT se hace automáticamente dentro de open_position
             result = exchange.open_position(
                 symbol, side, usdt_amount, leverage,
                 tp_percent, sl_percent, trailing_activation_percent, trailing_callback, tp_distribution
@@ -789,14 +1057,211 @@ async def handle_command(event, sender_id: int):
     """Maneja comandos"""
     try:
         message = event.message.text.strip()
-        command = message.split()[0].lower()
+        parts = message.split()
+        command = parts[0].lower()
 
         user_id = bot.get_user_identifier_from_telegram_id(sender_id)
         if not user_id:
             await event.reply(f"❌ Tu ID {sender_id} no está configurado")
             return
 
-        if command == "/balance":
+        # Verificar si es admin (primer usuario configurado en config.json)
+        user_list = list(bot.config.config.get("users", {}).keys())
+        # Remover 'default' de la lista
+        user_list = [u for u in user_list if u != "default"]
+        # El primer usuario real es el admin
+        admin_users = [user_list[0]] if user_list else []
+        is_admin = user_id in admin_users
+
+        # ===== COMANDOS DE ADMIN =====
+        if command == "/admin" and is_admin:
+            if len(parts) < 2:
+                admin_help = """
+👑 Comandos de Admin:
+
+/admin positions - Ver TODAS las posiciones
+/admin close USER SYMBOL - Cerrar posición de un usuario
+/admin balance USER - Ver balance de un usuario
+/admin status - Estado general del bot
+
+Ejemplo:
+/admin positions
+/admin close "Vera Marco Marco Vera" SUI
+/admin balance "Hernan Paredes"
+"""
+                await event.reply(admin_help)
+                return
+
+            sub_command = parts[1].lower()
+
+            if sub_command == "positions":
+                # Ver todas las posiciones de todos los usuarios
+                msg = "👑 TODAS LAS POSICIONES:\n\n"
+                total_positions = 0
+
+                for uid, exchange in bot.user_exchanges.items():
+                    positions = exchange.get_open_positions()
+                    if positions:
+                        msg += f"👤 {uid}:\n"
+                        for pos in positions:
+                            symbol = pos.get("symbol", "?")
+                            side = pos.get("positionSide", "?")
+                            qty = pos.get("positionAmt", 0)
+                            entry = pos.get("avgPrice", 0)
+                            pnl = pos.get("unrealizedProfit", 0)
+                            msg += f"  • {symbol} {side}\n"
+                            msg += f"    Entry: ${float(entry):.4f} | Qty: {qty}\n"
+                            msg += f"    PnL: ${float(pnl):.2f}\n"
+                            total_positions += 1
+                        msg += "\n"
+                    else:
+                        msg += f"👤 {uid}: Sin posiciones\n\n"
+
+                msg += f"📊 Total: {total_positions} posición(es)"
+                await event.reply(msg)
+
+            elif sub_command == "close":
+                if len(parts) < 4:
+                    await event.reply('❌ Uso: /admin close "USER" SYMBOL')
+                    return
+
+                target_user = parts[2].strip('"')
+                symbol_input = parts[3]
+
+                if target_user not in bot.user_exchanges:
+                    await event.reply(f"❌ Usuario '{target_user}' no encontrado")
+                    return
+
+                signal = {"action": "close", "symbol": symbol_input}
+                result = await bot.close_trade_for_user(signal, target_user)
+
+                if result["success"]:
+                    await event.reply(f"✅ Admin: Cerrado {symbol_input} de {target_user}")
+                else:
+                    await event.reply(f"❌ Error: {result.get('error')}")
+
+            elif sub_command == "balance":
+                if len(parts) < 3:
+                    await event.reply('❌ Uso: /admin balance "USER"')
+                    return
+
+                target_user = parts[2].strip('"')
+
+                if target_user not in bot.user_exchanges:
+                    await event.reply(f"❌ Usuario '{target_user}' no encontrado")
+                    return
+
+                exchange = bot.user_exchanges[target_user]
+                balance = exchange.get_balance()
+                await event.reply(f"💰 Balance de {target_user}: ${balance:.2f} USDT")
+
+            elif sub_command == "status":
+                msg = "🤖 Estado del Bot:\n\n"
+                msg += f"👥 Usuarios: {len(bot.user_exchanges)}\n"
+                msg += f"📊 Posiciones activas: {len(bot.active_positions)}\n"
+                msg += f"🔍 Monitor: {'✅ Activo' if bot.monitor.is_running else '❌ Inactivo'}\n\n"
+
+                for uid in bot.user_exchanges.keys():
+                    msg += f"• {uid}\n"
+
+                await event.reply(msg)
+
+        # ===== COMANDOS DE CONFIGURACIÓN =====
+        elif command == "/config":
+            if len(parts) < 2:
+                config_help = f"""
+⚙️ Configuración de {user_id}:
+
+/config leverage <valor>
+/config margin <valor>
+/config tp1 <porcentaje>
+/config tp2 <porcentaje>
+/config tp3 <porcentaje>
+/config tp1-dist <porcentaje>
+/config tp2-dist <porcentaje>
+/config tp3-dist <porcentaje>
+/config sl <porcentaje>
+/config trailing-activation <porcentaje>
+/config trailing-callback <porcentaje>
+/config show - Ver configuración actual
+
+Ejemplos:
+/config leverage 15
+/config margin 10
+/config tp1 2.5
+/config trailing-activation 3.0
+"""
+                await event.reply(config_help)
+                return
+
+            param = parts[1].lower()
+
+            if param == "show":
+                # Mostrar configuración actual
+                user_config = bot.config.get_user_config(user_id)
+                msg = f"⚙️ Configuración de {user_id}:\n\n"
+                msg += f"💰 Margen por trade: ${user_config.get('usdt_margin_per_trade')} USDT\n"
+                msg += f"⚡ Leverage: {user_config.get('default_leverage')}x\n\n"
+                msg += f"📈 Take Profits:\n"
+                msg += f"  TP1: +{user_config.get('tp1_percent')}% ({user_config.get('tp1_distribution')}% de posición)\n"
+                msg += f"  TP2: +{user_config.get('tp2_percent')}% ({user_config.get('tp2_distribution')}% de posición)\n"
+                msg += f"  TP3: +{user_config.get('tp3_percent')}% ({user_config.get('tp3_distribution')}% de posición)\n\n"
+                msg += f"🛑 Stop Loss: -{user_config.get('default_sl_percent')}%\n\n"
+                msg += f"📊 Trailing Stop:\n"
+                msg += f"  Activación: +{user_config.get('trailing_stop_activation_percent')}%\n"
+                msg += f"  Callback: {user_config.get('trailing_stop_callback')}%\n"
+                await event.reply(msg)
+                return
+
+            if len(parts) < 3:
+                await event.reply("❌ Falta el valor. Ejemplo: /config leverage 15")
+                return
+
+            try:
+                value = float(parts[2])
+            except ValueError:
+                await event.reply("❌ Valor inválido. Debe ser un número.")
+                return
+
+            # Mapeo de parámetros a claves del config
+            param_map = {
+                "leverage": "default_leverage",
+                "margin": "usdt_margin_per_trade",
+                "tp1": "tp1_percent",
+                "tp2": "tp2_percent",
+                "tp3": "tp3_percent",
+                "tp1-dist": "tp1_distribution",
+                "tp2-dist": "tp2_distribution",
+                "tp3-dist": "tp3_distribution",
+                "sl": "default_sl_percent",
+                "trailing-activation": "trailing_stop_activation_percent",
+                "trailing-callback": "trailing_stop_callback"
+            }
+
+            if param not in param_map:
+                await event.reply(f"❌ Parámetro '{param}' no reconocido. Usa /config para ver opciones.")
+                return
+
+            config_key = param_map[param]
+
+            # Actualizar en memoria
+            if user_id not in bot.config.config["users"]:
+                bot.config.config["users"][user_id] = {}
+
+            bot.config.config["users"][user_id][config_key] = value if param != "leverage" else int(value)
+
+            # Guardar en archivo
+            try:
+                with open("config.json", 'w') as f:
+                    json.dump(bot.config.config, f, indent=2)
+
+                await event.reply(f"✅ {param} actualizado a {value}\n\nUsa /config show para ver toda tu configuración")
+                logger.info(f"⚙️ {user_id} actualizó {param} = {value}")
+            except Exception as e:
+                await event.reply(f"❌ Error guardando configuración: {e}")
+
+        # ===== COMANDOS REGULARES =====
+        elif command == "/balance":
             exchange = bot.get_user_exchange(user_id)
             if not exchange:
                 await event.reply("❌ No configurado")
@@ -815,19 +1280,20 @@ async def handle_command(event, sender_id: int):
                 await event.reply("🔭 Sin posiciones")
                 return
 
-            msg = f"📊 Posiciones:\n\n"
+            msg = f"📊 Tus Posiciones:\n\n"
             for pos in positions:
                 symbol = pos.get("symbol", "?")
                 side = pos.get("positionSide", "?")
                 qty = pos.get("positionAmt", 0)
+                entry = pos.get("avgPrice", 0)
                 pnl = pos.get("unrealizedProfit", 0)
                 msg += f"• {symbol} {side}\n"
-                msg += f"  Qty: {qty} | PnL: ${float(pnl):.2f}\n"
+                msg += f"  Entry: ${float(entry):.4f} | Qty: {qty}\n"
+                msg += f"  PnL: ${float(pnl):.2f}\n\n"
 
             await event.reply(msg)
 
         elif command == "/close":
-            parts = message.split()
             if len(parts) < 2:
                 await event.reply("❌ Uso: /close SYMBOL")
                 return
@@ -846,21 +1312,48 @@ async def handle_command(event, sender_id: int):
 🤖 NeptuneBot
 
 👤 Tu cuenta: {user_id}
+{"👑 Admin" if is_admin else ""}
 
-Comandos:
-/balance - Ver balance
-/positions - Ver posiciones
+📋 Comandos Básicos:
+/balance - Ver tu balance
+/positions - Ver tus posiciones
 /close SYMBOL - Cerrar posición
-/help - Ayuda
+/config - Configuración personal
+/help - Esta ayuda
 
-Señales:
+⚙️ Configuración:
+/config show - Ver tu config
+/config leverage 15 - Cambiar leverage
+/config margin 10 - Cambiar margen
+/config tp1 2.5 - Cambiar TP1
+"""
+            if is_admin:
+                help_text += """
+👑 Comandos de Admin:
+/admin positions - Ver todas
+/admin close USER SYMBOL
+/admin balance USER
+
+
+ - Estado del bot
+"""
+
+            help_text += """
+📡 Señales Automáticas:
 • BUY BTC - Abre LONG
 • SELL ETH - Abre SHORT
 • CLOSE BTC - Cierra posición
 
-🔍 Monitor activo cada 30s
+🔍 Monitor: Activo cada 30s
 """
             await event.reply(help_text)
+
+        else:
+            await event.reply(f"❌ Comando desconocido: {command}\nUsa /help")
+
+    except Exception as e:
+        logger.error(f"Error comando: {e}")
+        await event.reply(f"❌ Error: {str(e)}")
 
     except Exception as e:
         logger.error(f"Error comando: {e}")

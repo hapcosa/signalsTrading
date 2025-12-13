@@ -19,8 +19,8 @@
       "trailing_stop_callback": 1.0,
       "max_open_positions": 5
     },
-    "Hernan Paredes": {
-      "usdt_margin_per_trade": 10.0,
+    "Obrero": {
+      "usdt_margin_per_trade": 8.0,
       "default_leverage": 12,
       "min_balance_required": 50,
       "tp1_percent": 2.0,
@@ -30,11 +30,11 @@
       "tp2_distribution": 35,
       "tp3_distribution": 20,
       "default_sl_percent": 2.0,
-      "trailing_stop_activation_percent": 2.5,
-      "trailing_stop_callback": 1.0
+      "trailing_stop_activation_percent": 2.8,
+      "trailing_stop_callback": 1.2
     },
-    "Vera Marco Marco Vera": {
-      "usdt_margin_per_trade": 5.0,
+    "Gen Z": {
+      "usdt_margin_per_trade": 8.0,
       "default_leverage": 12,
       "min_balance_required": 50,
       "tp1_percent": 2.0,
@@ -45,7 +45,7 @@
       "tp3_distribution": 20,
       "default_sl_percent": 2.0,
       "trailing_stop_activation_percent": 2.5,
-      "trailing_stop_callback": 1.0
+      "trailing_stop_callback": 1.2
     }
   },
   "notifications": {
