@@ -419,36 +419,84 @@ root_logger.addHandler(web_handler)
 # =============================================================================
 
 class ConfigManager:
-    """Gestor de configuración JSON por usuario"""
+    """Gestor de configuración JSON por usuario - Multi-cuenta"""
 
     def __init__(self, config_path: str = "config.json"):
+        self.config_path = config_path
         with open(config_path, 'r') as f:
             self.config = json.load(f)
 
-    def get_user_config(self, username: str) -> Dict:
-        """Obtiene configuración específica de un usuario"""
+    def save(self):
+        """Guarda la configuración en el archivo"""
+        with open(self.config_path, 'w') as f:
+            json.dump(self.config, f, indent=2)
+
+    def get_user_accounts(self, username: str) -> Dict:
+        """Obtiene todas las cuentas de un usuario"""
         users = self.config.get("users", {})
-        user_config = users.get(username, users.get("default", {}))
+        user_data = users.get(username, {})
+        return user_data.get("accounts", {})
 
+    def get_account_config(self, username: str, account_name: str) -> Dict:
+        """Obtiene configuración de una cuenta específica de un usuario"""
+        users = self.config.get("users", {})
         default_config = users.get("default", {})
-        merged_config = {**default_config, **user_config}
+        user_data = users.get(username, {})
 
-        # Distribuciones de TP (ahora dejamos 15% para trailing stop)
-        if "tp1_distribution" not in merged_config:
-            merged_config["tp1_distribution"] = 30
-        if "tp2_distribution" not in merged_config:
-            merged_config["tp2_distribution"] = 35
-        if "tp3_distribution" not in merged_config:
-            merged_config["tp3_distribution"] = 20
-        # 15% restante lo gestiona el trailing stop
+        # Si el usuario tiene estructura de accounts (multi-cuenta)
+        if "accounts" in user_data:
+            account_config = user_data.get("accounts", {}).get(account_name, {})
+            # Merge: default -> account_config
+            merged_config = {**default_config, **account_config}
+        else:
+            # Compatibilidad con estructura antigua (single account)
+            merged_config = {**default_config, **user_data}
 
-        # Trailing stop callback rate (cuánto retrocede antes de cerrar)
-        if "trailing_stop_callback" not in merged_config:
-            merged_config["trailing_stop_callback"] = 1.0  # 1% de retroceso
+        # Asegurar valores por defecto
+        defaults = {
+            "tp1_distribution": 30,
+            "tp2_distribution": 35,
+            "tp3_distribution": 20,
+            "trailing_stop_callback": 1.0,
+            "trailing_stop_activation_percent": 2.5
+        }
 
-        # Trailing stop activation (a qué % de ganancia se activa)
-        if "trailing_stop_activation_percent" not in merged_config:
-            merged_config["trailing_stop_activation_percent"] = 2.5  # Se activa al +2.5%
+        for key, value in defaults.items():
+            if key not in merged_config:
+                merged_config[key] = value
+
+        return merged_config
+
+    def get_user_config(self, username: str, account_name: str = None) -> Dict:
+        """Obtiene configuración de un usuario (compatible con código existente)"""
+        if account_name:
+            return self.get_account_config(username, account_name)
+
+        # Si no se especifica cuenta, usar la primera cuenta disponible o config legacy
+        users = self.config.get("users", {})
+        user_data = users.get(username, {})
+
+        if "accounts" in user_data:
+            # Retornar config de la primera cuenta habilitada
+            for acc_name, acc_config in user_data["accounts"].items():
+                if acc_config.get("enabled", True):
+                    return self.get_account_config(username, acc_name)
+
+        # Fallback a estructura legacy
+        default_config = users.get("default", {})
+        merged_config = {**default_config, **user_data}
+
+        defaults = {
+            "tp1_distribution": 30,
+            "tp2_distribution": 35,
+            "tp3_distribution": 20,
+            "trailing_stop_callback": 1.0,
+            "trailing_stop_activation_percent": 2.5
+        }
+
+        for key, value in defaults.items():
+            if key not in merged_config:
+                merged_config[key] = value
 
         logger.info(
             f"📋 Config {username}: margen=${merged_config.get('usdt_margin_per_trade')}, "
@@ -457,6 +505,56 @@ class ConfigManager:
             f"en +{merged_config.get('tp1_percent')}/{merged_config.get('tp2_percent')}/{merged_config.get('tp3_percent')}%, "
             f"trailing: +{merged_config.get('trailing_stop_activation_percent')}%, callback={merged_config.get('trailing_stop_callback')}%")
         return merged_config
+
+    def add_account(self, username: str, account_name: str, env_prefix: str, config: Dict = None) -> bool:
+        """Añade una nueva cuenta a un usuario"""
+        if username not in self.config["users"]:
+            self.config["users"][username] = {"accounts": {}}
+
+        if "accounts" not in self.config["users"][username]:
+            self.config["users"][username]["accounts"] = {}
+
+        default_config = self.config["users"].get("default", {})
+        account_config = {
+            "env_prefix": env_prefix,
+            "enabled": True,
+            **default_config,
+            **(config or {})
+        }
+
+        self.config["users"][username]["accounts"][account_name] = account_config
+        self.save()
+        return True
+
+    def remove_account(self, username: str, account_name: str) -> bool:
+        """Elimina una cuenta de un usuario"""
+        if username in self.config["users"]:
+            if "accounts" in self.config["users"][username]:
+                if account_name in self.config["users"][username]["accounts"]:
+                    del self.config["users"][username]["accounts"][account_name]
+                    self.save()
+                    return True
+        return False
+
+    def toggle_account(self, username: str, account_name: str, enabled: bool) -> bool:
+        """Habilita/deshabilita una cuenta"""
+        if username in self.config["users"]:
+            if "accounts" in self.config["users"][username]:
+                if account_name in self.config["users"][username]["accounts"]:
+                    self.config["users"][username]["accounts"][account_name]["enabled"] = enabled
+                    self.save()
+                    return True
+        return False
+
+    def update_account_config(self, username: str, account_name: str, key: str, value) -> bool:
+        """Actualiza un parámetro de configuración de una cuenta"""
+        if username in self.config["users"]:
+            if "accounts" in self.config["users"][username]:
+                if account_name in self.config["users"][username]["accounts"]:
+                    self.config["users"][username]["accounts"][account_name][key] = value
+                    self.save()
+                    return True
+        return False
 
     def get(self, *keys, default=None):
         """Obtiene valor de configuración global"""
@@ -988,28 +1086,29 @@ class PositionMonitor:
                 await asyncio.sleep(self.check_interval)
 
     async def check_all_positions(self):
-        """Verifica todas las posiciones de todos los usuarios"""
-        for user_id, exchange in self.bot.user_exchanges.items():
-            try:
-                positions = exchange.get_open_positions()
+        """Verifica todas las posiciones de todas las cuentas de todos los usuarios"""
+        for user_id, accounts in self.bot.user_accounts.items():
+            for account_name, exchange in accounts.items():
+                try:
+                    positions = exchange.get_open_positions()
 
-                if positions:
-                    logger.info(f"🔍 {user_id}: Detectadas {len(positions)} posición(es)")
+                    if positions:
+                        logger.info(f"🔍 {user_id}/{account_name}: Detectadas {len(positions)} posición(es)")
+                        for pos in positions:
+                            symbol = pos.get("symbol", "?")
+                            side = pos.get("positionSide", "?")
+                            qty = pos.get("positionAmt", 0)
+                            logger.info(f"   📍 {symbol} {side} qty={qty}")
+                    else:
+                        logger.debug(f"🔍 {user_id}/{account_name}: Sin posiciones abiertas")
+
                     for pos in positions:
-                        symbol = pos.get("symbol", "?")
-                        side = pos.get("positionSide", "?")
-                        qty = pos.get("positionAmt", 0)
-                        logger.info(f"   📍 {symbol} {side} qty={qty}")
-                else:
-                    logger.debug(f"🔍 {user_id}: Sin posiciones abiertas")
+                        await self.verify_position_orders(user_id, account_name, exchange, pos)
 
-                for pos in positions:
-                    await self.verify_position_orders(user_id, exchange, pos)
+                except Exception as e:
+                    logger.error(f"Error verificando posiciones de {user_id}/{account_name}: {e}")
 
-            except Exception as e:
-                logger.error(f"Error verificando posiciones de {user_id}: {e}")
-
-    async def verify_position_orders(self, user_id: str, exchange: BingXAPI, position: Dict):
+    async def verify_position_orders(self, user_id: str, account_name: str, exchange: BingXAPI, position: Dict):
         """Verifica que una posición tenga todos sus TP/SL/Trailing"""
         try:
             symbol = position.get("symbol")
@@ -1021,7 +1120,7 @@ class PositionMonitor:
                 return
 
             # Crear ID único para la posición
-            position_id = f"{user_id}_{symbol}_{side}"
+            position_id = f"{user_id}_{account_name}_{symbol}_{side}"
 
             # Si esta posición ha fallado 3+ veces, saltarla
             if position_id in self.failed_positions and self.failed_positions[position_id] >= 3:
@@ -1057,8 +1156,8 @@ class PositionMonitor:
                 elif order_type == "TRAILING_STOP_MARKET":
                     has_trailing = True
 
-            # Obtener configuración del usuario
-            user_config = self.bot.config.get_user_config(user_id)
+            # Obtener configuración del usuario/cuenta
+            user_config = self.bot.config.get_account_config(user_id, account_name)
 
             # Obtener info del contrato
             contract_info = exchange.get_contract_info(symbol)
@@ -1067,7 +1166,7 @@ class PositionMonitor:
 
             # Verificar y corregir SL
             if not has_sl:
-                logger.warning(f"⚠️ {user_id} - {symbol}: Falta SL, configurando...")
+                logger.warning(f"⚠️ {user_id}/{account_name} - {symbol}: Falta SL, configurando...")
                 sl_percent = user_config.get("default_sl_percent", 1.8)
 
                 if side == "LONG":
@@ -1081,7 +1180,8 @@ class PositionMonitor:
 
             # Verificar y corregir TPs
             if tp_count < 3:
-                logger.warning(f"⚠️ {user_id} - {symbol}: Solo {tp_count}/3 TPs, configurando faltantes...")
+                logger.warning(
+                    f"⚠️ {user_id}/{account_name} - {symbol}: Solo {tp_count}/3 TPs, configurando faltantes...")
 
                 tp_percents = [
                     user_config.get("tp1_percent", 2.0),
@@ -1136,7 +1236,8 @@ class PositionMonitor:
 
                     # Verificar mínimo
                     if min_qty > 0 and tp_qty < min_qty:
-                        logger.warning(f"⚠️ {user_id} - {symbol}: TP{i + 1} qty={tp_qty} < min={min_qty}, ajustando")
+                        logger.warning(
+                            f"⚠️ {user_id}/{account_name} - {symbol}: TP{i + 1} qty={tp_qty} < min={min_qty}, ajustando")
                         tp_qty = min_qty
 
                     # Verificar que no exceda la cantidad restante
@@ -1164,11 +1265,11 @@ class PositionMonitor:
                         await asyncio.sleep(0.5)
                     else:
                         logger.warning(
-                            f"⚠️ {user_id} - {symbol}: TP{i + 1} omitido - qty={tp_qty}, min_valid={min_valid_qty}, remaining={remaining_for_tps}")
+                            f"⚠️ {user_id}/{account_name} - {symbol}: TP{i + 1} omitido - qty={tp_qty}, min_valid={min_valid_qty}, remaining={remaining_for_tps}")
 
             # Verificar y corregir Trailing Stop
             if not has_trailing:
-                logger.warning(f"⚠️ {user_id} - {symbol}: Falta Trailing Stop, configurando...")
+                logger.warning(f"⚠️ {user_id}/{account_name} - {symbol}: Falta Trailing Stop, configurando...")
 
                 trailing_callback = user_config.get("trailing_stop_callback", 1.0)
                 trailing_activation_percent = user_config.get("trailing_stop_activation_percent", 2.5)
@@ -1186,7 +1287,7 @@ class PositionMonitor:
 
                 if trailing_quantity < min_qty:
                     logger.warning(
-                        f"⚠️ {user_id} - {symbol}: Trailing qty={trailing_quantity} < min={min_qty}, ajustando")
+                        f"⚠️ {user_id}/{account_name} - {symbol}: Trailing qty={trailing_quantity} < min={min_qty}, ajustando")
                     trailing_quantity = min_qty
 
                 if trailing_quantity > 0 and trailing_quantity <= abs(quantity):
@@ -1194,7 +1295,7 @@ class PositionMonitor:
                                                trailing_quantity)
                 else:
                     logger.warning(
-                        f"⚠️ {user_id} - {symbol}: No hay cantidad válida para trailing ({trailing_quantity})")
+                        f"⚠️ {user_id}/{account_name} - {symbol}: No hay cantidad válida para trailing ({trailing_quantity})")
 
         except Exception as e:
             logger.error(f"Error verificando órdenes de {symbol}: {e}")
@@ -1206,53 +1307,123 @@ class PositionMonitor:
 
 
 class TradingBot:
-    """Bot principal"""
+    """Bot principal - Multi-cuenta por usuario"""
 
     def __init__(self, config_path: str = "config.json"):
         self.config = ConfigManager(config_path)
         self.active_positions = {}
-        self.user_exchanges = {}
+        # Nueva estructura: {username: {account_name: exchange}}
+        self.user_accounts = {}
         self.user_id_to_name = {}
         self.monitor = PositionMonitor(self)
 
         # Configurar usuarios
         self._setup_users()
 
-        if not self.user_exchanges:
+        if not self.user_accounts:
             logger.error("❌ No hay exchanges configurados")
 
-        logger.info(f"👥 Usuarios: {list(self.user_exchanges.keys())}")
+        # Log de usuarios y cuentas
+        for user, accounts in self.user_accounts.items():
+            acc_names = list(accounts.keys())
+            logger.info(f"👥 {user}: {len(acc_names)} cuenta(s) - {acc_names}")
 
     def _setup_users(self):
-        """Configura usuarios desde .env"""
-        users_config = [
+        """Configura usuarios desde .env y config.json"""
+        # Mapeo de usuarios de Telegram
+        telegram_users = [
             {
                 "username": os.getenv("TELEGRAM_USERNAME", "").strip().strip("'\""),
-                "telegram_id": os.getenv("TELEGRAM_USER_ID"),
-                "api_key": os.getenv("BINGX_API_KEY"),
-                "api_secret": os.getenv("BINGX_SECRET_KEY")
+                "telegram_id": os.getenv("TELEGRAM_USER_ID")
             },
             {
                 "username": os.getenv("TELEGRAM_USERNAME2", "").strip().strip("'\""),
-                "telegram_id": os.getenv("TELEGRAM_USER_ID2"),
-                "api_key": os.getenv("BINGX2_API_KEY"),
-                "api_secret": os.getenv("BINGX2_SECRET_KEY")
+                "telegram_id": os.getenv("TELEGRAM_USER_ID2")
             }
         ]
 
-        for user in users_config:
-            if user["username"] and user["api_key"] and user["api_secret"]:
-                exchange = BingXAPI(user["api_key"], user["api_secret"])
-                exchange.name = f"BingX-{user['username']}"
+        # Registrar mapeo telegram_id -> username
+        for user in telegram_users:
+            if user["username"] and user["telegram_id"]:
+                self.user_id_to_name[int(user["telegram_id"])] = user["username"]
+                self.user_accounts[user["username"]] = {}
 
-                if exchange.is_available():
-                    self.user_exchanges[user["username"]] = exchange
-                    if user["telegram_id"]:
-                        self.user_id_to_name[int(user["telegram_id"])] = user["username"]
-                    logger.info(f"✅ {user['username']} inicializado")
+        # Configurar cuentas desde config.json
+        for username in self.user_accounts.keys():
+            accounts = self.config.get_user_accounts(username)
 
-    def get_user_exchange(self, user_id: str) -> Optional[BingXAPI]:
-        return self.user_exchanges.get(user_id)
+            if accounts:
+                # Nueva estructura multi-cuenta
+                for account_name, account_config in accounts.items():
+                    if not account_config.get("enabled", True):
+                        logger.info(f"⏸️ {username}/{account_name} deshabilitada")
+                        continue
+
+                    env_prefix = account_config.get("env_prefix", "BINGX")
+                    api_key = os.getenv(f"{env_prefix}_API_KEY")
+                    api_secret = os.getenv(f"{env_prefix}_SECRET_KEY")
+
+                    if api_key and api_secret:
+                        exchange = BingXAPI(api_key, api_secret)
+                        exchange.name = f"BingX-{username}-{account_name}"
+                        exchange.account_name = account_name
+
+                        if exchange.is_available():
+                            self.user_accounts[username][account_name] = exchange
+                            logger.info(f"✅ {username}/{account_name} ({env_prefix}) inicializado")
+                        else:
+                            logger.warning(f"⚠️ {username}/{account_name} no disponible")
+                    else:
+                        logger.warning(f"⚠️ {username}/{account_name}: Faltan credenciales {env_prefix}")
+            else:
+                # Compatibilidad: estructura legacy (un usuario = una cuenta)
+                # Mapeo por defecto basado en posición
+                if username == os.getenv("TELEGRAM_USERNAME", "").strip().strip("'\""):
+                    api_key = os.getenv("BINGX_API_KEY")
+                    api_secret = os.getenv("BINGX_SECRET_KEY")
+                    env_prefix = "BINGX"
+                else:
+                    api_key = os.getenv("BINGX2_API_KEY")
+                    api_secret = os.getenv("BINGX2_SECRET_KEY")
+                    env_prefix = "BINGX2"
+
+                if api_key and api_secret:
+                    exchange = BingXAPI(api_key, api_secret)
+                    exchange.name = f"BingX-{username}"
+                    exchange.account_name = "Principal"
+
+                    if exchange.is_available():
+                        self.user_accounts[username]["Principal"] = exchange
+                        logger.info(f"✅ {username}/Principal (legacy) inicializado")
+
+    # Propiedades de compatibilidad con código existente
+    @property
+    def user_exchanges(self):
+        """Compatibilidad: retorna el primer exchange de cada usuario"""
+        result = {}
+        for username, accounts in self.user_accounts.items():
+            if accounts:
+                result[username] = next(iter(accounts.values()))
+        return result
+
+    def get_user_exchange(self, user_id: str, account_name: str = None) -> Optional[BingXAPI]:
+        """Obtiene exchange de un usuario (opcionalmente una cuenta específica)"""
+        if user_id not in self.user_accounts:
+            return None
+
+        accounts = self.user_accounts[user_id]
+        if not accounts:
+            return None
+
+        if account_name:
+            return accounts.get(account_name)
+
+        # Retornar el primero disponible
+        return next(iter(accounts.values()), None)
+
+    def get_user_all_exchanges(self, user_id: str) -> Dict[str, BingXAPI]:
+        """Obtiene todos los exchanges de un usuario"""
+        return self.user_accounts.get(user_id, {})
 
     def get_user_identifier_from_telegram_id(self, telegram_id: int) -> Optional[str]:
         return self.user_id_to_name.get(telegram_id)
@@ -1297,34 +1468,37 @@ class TradingBot:
             return None
 
     async def execute_signal_for_all_users(self, signal: Dict) -> List[Dict]:
-        """Ejecuta señal para todos"""
+        """Ejecuta señal para todas las cuentas de todos los usuarios"""
         results = []
 
-        for user_id in self.user_exchanges.keys():
-            logger.info(f"\n{'=' * 60}")
-            logger.info(f"👤 Ejecutando para {user_id}")
-            logger.info(f"{'=' * 60}")
+        for user_id, accounts in self.user_accounts.items():
+            for account_name, exchange in accounts.items():
+                logger.info(f"\n{'=' * 60}")
+                logger.info(f"👤 Ejecutando para {user_id}/{account_name}")
+                logger.info(f"{'=' * 60}")
 
-            if signal["action"] == "open":
-                result = await self.open_trade_for_user(signal, user_id)
-            elif signal["action"] == "close":
-                result = await self.close_trade_for_user(signal, user_id)
-            else:
-                result = {"success": False, "error": "Acción inválida"}
+                if signal["action"] == "open":
+                    result = await self.open_trade_for_user(signal, user_id, account_name)
+                elif signal["action"] == "close":
+                    result = await self.close_trade_for_user(signal, user_id, account_name)
+                else:
+                    result = {"success": False, "error": "Acción inválida"}
 
-            result["user_identifier"] = user_id
-            results.append(result)
+                result["user_identifier"] = f"{user_id}/{account_name}"
+                result["username"] = user_id
+                result["account_name"] = account_name
+                results.append(result)
 
         return results
 
-    async def open_trade_for_user(self, signal: Dict, user_id: str) -> Dict:
-        """Abre trade para un usuario"""
+    async def open_trade_for_user(self, signal: Dict, user_id: str, account_name: str = None) -> Dict:
+        """Abre trade para un usuario/cuenta"""
         try:
-            exchange = self.get_user_exchange(user_id)
+            exchange = self.get_user_exchange(user_id, account_name)
             if not exchange:
-                return {"success": False, "error": "Usuario no configurado"}
+                return {"success": False, "error": "Usuario/cuenta no configurado"}
 
-            user_config = self.config.get_user_config(user_id)
+            user_config = self.config.get_user_config(user_id, account_name)
 
             usdt_amount = user_config.get("usdt_margin_per_trade", 5.0)
             leverage = user_config.get("default_leverage", 10)
@@ -1409,12 +1583,12 @@ class TradingBot:
             logger.error(f"❌ Error: {e}")
             return {"success": False, "error": str(e)}
 
-    async def close_trade_for_user(self, signal: Dict, user_id: str) -> Dict:
-        """Cierra trade"""
+    async def close_trade_for_user(self, signal: Dict, user_id: str, account_name: str = None) -> Dict:
+        """Cierra trade para una cuenta específica"""
         try:
-            exchange = self.get_user_exchange(user_id)
+            exchange = self.get_user_exchange(user_id, account_name)
             if not exchange:
-                return {"success": False, "error": "Usuario no configurado"}
+                return {"success": False, "error": "Usuario/cuenta no configurado"}
 
             symbol = self.normalize_symbol(signal["symbol"])
 
@@ -1426,7 +1600,7 @@ class TradingBot:
             result = exchange.close_position(symbol)
 
             if result["success"]:
-                key = f"{user_id}_{symbol}"
+                key = f"{user_id}_{account_name}_{symbol}"
                 if key in self.active_positions:
                     del self.active_positions[key]
 
@@ -1560,24 +1734,20 @@ Ejemplo:
                 config_help = f"""
 ⚙️ Configuración de {user_id}:
 
-/config leverage <valor>
-/config margin <valor>
-/config tp1 <porcentaje>
-/config tp2 <porcentaje>
-/config tp3 <porcentaje>
-/config tp1-dist <porcentaje>
-/config tp2-dist <porcentaje>
-/config tp3-dist <porcentaje>
-/config sl <porcentaje>
-/config trailing-activation <porcentaje>
-/config trailing-callback <porcentaje>
-/config show - Ver configuración actual
+/config show [cuenta] - Ver configuración
+/config <param> <valor> [cuenta]
+
+Parámetros:
+• leverage, margin
+• tp1, tp2, tp3
+• tp1-dist, tp2-dist, tp3-dist
+• sl, trailing-activation, trailing-callback
 
 Ejemplos:
+/config show
+/config show Principal
 /config leverage 15
-/config margin 10
-/config tp1 2.5
-/config trailing-activation 3.0
+/config margin 10 Secundaria
 """
                 await event.reply(config_help)
                 return
@@ -1586,18 +1756,35 @@ Ejemplos:
 
             if param == "show":
                 # Mostrar configuración actual
-                user_config = bot.config.get_user_config(user_id)
-                msg = f"⚙️ Configuración de {user_id}:\n\n"
-                msg += f"💰 Margen por trade: ${user_config.get('usdt_margin_per_trade')} USDT\n"
-                msg += f"⚡ Leverage: {user_config.get('default_leverage')}x\n\n"
-                msg += f"📈 Take Profits:\n"
-                msg += f"  TP1: +{user_config.get('tp1_percent')}% ({user_config.get('tp1_distribution')}% de posición)\n"
-                msg += f"  TP2: +{user_config.get('tp2_percent')}% ({user_config.get('tp2_distribution')}% de posición)\n"
-                msg += f"  TP3: +{user_config.get('tp3_percent')}% ({user_config.get('tp3_distribution')}% de posición)\n\n"
-                msg += f"🛑 Stop Loss: -{user_config.get('default_sl_percent')}%\n\n"
-                msg += f"📊 Trailing Stop:\n"
-                msg += f"  Activación: +{user_config.get('trailing_stop_activation_percent')}%\n"
-                msg += f"  Callback: {user_config.get('trailing_stop_callback')}%\n"
+                account_name = parts[2] if len(parts) > 2 else None
+                accounts = bot.get_user_all_exchanges(user_id)
+
+                if account_name:
+                    # Config de cuenta específica
+                    if account_name not in accounts:
+                        await event.reply(f"❌ Cuenta '{account_name}' no encontrada")
+                        return
+
+                    user_config = bot.config.get_account_config(user_id, account_name)
+                    msg = f"⚙️ Config de {account_name}:\n\n"
+                    msg += f"💰 Margen: ${user_config.get('usdt_margin_per_trade')} USDT\n"
+                    msg += f"⚡ Leverage: {user_config.get('default_leverage')}x\n\n"
+                    msg += f"📈 Take Profits:\n"
+                    msg += f"  TP1: +{user_config.get('tp1_percent')}% ({user_config.get('tp1_distribution')}%)\n"
+                    msg += f"  TP2: +{user_config.get('tp2_percent')}% ({user_config.get('tp2_distribution')}%)\n"
+                    msg += f"  TP3: +{user_config.get('tp3_percent')}% ({user_config.get('tp3_distribution')}%)\n\n"
+                    msg += f"🛑 Stop Loss: -{user_config.get('default_sl_percent')}%\n"
+                    msg += f"📊 Trailing: +{user_config.get('trailing_stop_activation_percent')}% / {user_config.get('trailing_stop_callback')}%\n"
+                else:
+                    # Config de todas las cuentas
+                    msg = f"⚙️ Configuración de todas las cuentas:\n"
+                    for acc_name in accounts.keys():
+                        user_config = bot.config.get_account_config(user_id, acc_name)
+                        msg += f"\n🏦 {acc_name}:\n"
+                        msg += f"  💰 ${user_config.get('usdt_margin_per_trade')} | ⚡ {user_config.get('default_leverage')}x\n"
+                        msg += f"  📈 TP: +{user_config.get('tp1_percent')}/{user_config.get('tp2_percent')}/{user_config.get('tp3_percent')}%\n"
+                        msg += f"  🛑 SL: -{user_config.get('default_sl_percent')}%\n"
+
                 await event.reply(msg)
                 return
 
@@ -1610,6 +1797,9 @@ Ejemplos:
             except ValueError:
                 await event.reply("❌ Valor inválido. Debe ser un número.")
                 return
+
+            # Determinar si hay cuenta específica
+            account_name = parts[3] if len(parts) > 3 else None
 
             # Mapeo de parámetros a claves del config
             param_map = {
@@ -1631,108 +1821,329 @@ Ejemplos:
                 return
 
             config_key = param_map[param]
+            final_value = int(value) if param == "leverage" else value
 
-            # Actualizar en memoria
-            if user_id not in bot.config.config["users"]:
-                bot.config.config["users"][user_id] = {}
-
-            bot.config.config["users"][user_id][config_key] = value if param != "leverage" else int(value)
-
-            # Guardar en archivo
+            # Guardar configuración
             try:
-                with open("config.json", 'w') as f:
-                    json.dump(bot.config.config, f, indent=2)
+                if account_name:
+                    # Actualizar cuenta específica
+                    success = bot.config.update_account_config(user_id, account_name, config_key, final_value)
+                    if success:
+                        await event.reply(f"✅ {account_name}: {param} = {value}")
+                    else:
+                        await event.reply(f"❌ Cuenta '{account_name}' no encontrada")
+                else:
+                    # Actualizar todas las cuentas del usuario
+                    accounts = bot.get_user_all_exchanges(user_id)
+                    for acc_name in accounts.keys():
+                        bot.config.update_account_config(user_id, acc_name, config_key, final_value)
 
-                await event.reply(f"✅ {param} actualizado a {value}\n\nUsa /config show para ver toda tu configuración")
+                    await event.reply(f"✅ {param} = {value} en todas las cuentas")
+
                 logger.info(f"⚙️ {user_id} actualizó {param} = {value}")
             except Exception as e:
-                await event.reply(f"❌ Error guardando configuración: {e}")
+                await event.reply(f"❌ Error guardando: {e}")
 
         # ===== COMANDOS REGULARES =====
         elif command == "/balance":
-            exchange = bot.get_user_exchange(user_id)
-            if not exchange:
-                await event.reply("❌ No configurado")
-                return
-            balance = exchange.get_balance()
-            await event.reply(f"💰 Balance: ${balance:.2f} USDT")
+            account_name = parts[1] if len(parts) > 1 else None
+
+            if account_name:
+                # Balance de cuenta específica
+                exchange = bot.get_user_exchange(user_id, account_name)
+                if not exchange:
+                    await event.reply(f"❌ Cuenta '{account_name}' no encontrada")
+                    return
+                balance = exchange.get_balance()
+                await event.reply(f"💰 {account_name}: ${balance:.2f} USDT")
+            else:
+                # Balance de todas las cuentas
+                accounts = bot.get_user_all_exchanges(user_id)
+                if not accounts:
+                    await event.reply("❌ No tienes cuentas configuradas")
+                    return
+
+                total = 0
+                msg = "💰 Balance por cuenta:\n\n"
+                for acc_name, exchange in accounts.items():
+                    balance = exchange.get_balance()
+                    total += balance
+                    msg += f"• {acc_name}: ${balance:.2f}\n"
+
+                msg += f"\n📊 Total: ${total:.2f} USDT"
+                await event.reply(msg)
 
         elif command == "/positions":
-            exchange = bot.get_user_exchange(user_id)
-            if not exchange:
-                await event.reply("❌ No configurado")
-                return
+            account_name = parts[1] if len(parts) > 1 else None
 
-            positions = exchange.get_open_positions()
-            if not positions:
-                await event.reply("🔭 Sin posiciones")
-                return
+            if account_name:
+                # Posiciones de cuenta específica
+                exchange = bot.get_user_exchange(user_id, account_name)
+                if not exchange:
+                    await event.reply(f"❌ Cuenta '{account_name}' no encontrada")
+                    return
 
-            msg = f"📊 Tus Posiciones:\n\n"
-            for pos in positions:
-                symbol = pos.get("symbol", "?")
-                side = pos.get("positionSide", "?")
-                qty = pos.get("positionAmt", 0)
-                entry = pos.get("avgPrice", 0)
-                pnl = pos.get("unrealizedProfit", 0)
-                msg += f"• {symbol} {side}\n"
-                msg += f"  Entry: ${float(entry):.4f} | Qty: {qty}\n"
-                msg += f"  PnL: ${float(pnl):.2f}\n\n"
+                positions = exchange.get_open_positions()
+                if not positions:
+                    await event.reply(f"🔭 {account_name}: Sin posiciones")
+                    return
 
-            await event.reply(msg)
+                msg = f"📊 Posiciones de {account_name}:\n\n"
+                for pos in positions:
+                    symbol = pos.get("symbol", "?")
+                    side = pos.get("positionSide", "?")
+                    qty = pos.get("positionAmt", 0)
+                    entry = pos.get("avgPrice", 0)
+                    pnl = pos.get("unrealizedProfit", 0)
+                    msg += f"• {symbol} {side}\n"
+                    msg += f"  Entry: ${float(entry):.4f} | Qty: {qty}\n"
+                    msg += f"  PnL: ${float(pnl):.2f}\n\n"
+
+                await event.reply(msg)
+            else:
+                # Posiciones de todas las cuentas
+                accounts = bot.get_user_all_exchanges(user_id)
+                if not accounts:
+                    await event.reply("❌ No tienes cuentas configuradas")
+                    return
+
+                msg = "📊 Todas tus posiciones:\n"
+                total_pnl = 0
+                has_positions = False
+
+                for acc_name, exchange in accounts.items():
+                    positions = exchange.get_open_positions()
+                    if positions:
+                        has_positions = True
+                        msg += f"\n🏦 {acc_name}:\n"
+                        for pos in positions:
+                            symbol = pos.get("symbol", "?")
+                            side = pos.get("positionSide", "?")
+                            qty = pos.get("positionAmt", 0)
+                            entry = pos.get("avgPrice", 0)
+                            pnl = float(pos.get("unrealizedProfit", 0))
+                            total_pnl += pnl
+                            msg += f"  • {symbol} {side}: ${pnl:.2f}\n"
+
+                if not has_positions:
+                    await event.reply("🔭 Sin posiciones en ninguna cuenta")
+                else:
+                    msg += f"\n💵 PnL Total: ${total_pnl:.2f}"
+                    await event.reply(msg)
 
         elif command == "/close":
             if len(parts) < 2:
-                await event.reply("❌ Uso: /close SYMBOL")
+                await event.reply("❌ Uso: /close SYMBOL [cuenta]")
                 return
 
             symbol_input = parts[1]
-            signal = {"action": "close", "symbol": symbol_input}
-            result = await bot.close_trade_for_user(signal, user_id)
+            account_name = parts[2] if len(parts) > 2 else None
 
-            if result["success"]:
-                await event.reply(f"✅ Cerrado: {symbol_input}")
+            if account_name:
+                # Cerrar en cuenta específica
+                signal = {"action": "close", "symbol": symbol_input}
+                result = await bot.close_trade_for_user(signal, user_id, account_name)
+                if result["success"]:
+                    await event.reply(f"✅ Cerrado {symbol_input} en {account_name}")
+                else:
+                    await event.reply(f"❌ Error: {result.get('error')}")
             else:
-                await event.reply(f"❌ Error: {result.get('error')}")
+                # Cerrar en todas las cuentas del usuario
+                accounts = bot.get_user_all_exchanges(user_id)
+                results = []
+                for acc_name in accounts.keys():
+                    signal = {"action": "close", "symbol": symbol_input}
+                    result = await bot.close_trade_for_user(signal, user_id, acc_name)
+                    results.append(f"• {acc_name}: {'✅' if result['success'] else '❌ ' + result.get('error', '')}")
+
+                await event.reply(f"📊 Cerrando {symbol_input}:\n" + "\n".join(results))
+
+        # ===== COMANDOS DE CUENTAS =====
+        elif command == "/accounts":
+            accounts = bot.get_user_all_exchanges(user_id)
+            if not accounts:
+                await event.reply("❌ No tienes cuentas configuradas")
+                return
+
+            msg = f"📊 Tus Cuentas ({len(accounts)}):\n\n"
+            for acc_name, exchange in accounts.items():
+                balance = exchange.get_balance()
+                config = bot.config.get_account_config(user_id, acc_name)
+                enabled = config.get("enabled", True)
+                env_prefix = config.get("env_prefix", "?")
+                msg += f"{'✅' if enabled else '⏸️'} **{acc_name}** ({env_prefix})\n"
+                msg += f"   💰 Balance: ${balance:.2f}\n"
+                msg += f"   ⚡ Leverage: {config.get('default_leverage', 10)}x\n"
+                msg += f"   💵 Margen: ${config.get('usdt_margin_per_trade', 5)}\n\n"
+
+            await event.reply(msg)
+
+        elif command == "/account":
+            if len(parts) < 2:
+                account_help = f"""
+📊 Gestión de Cuentas
+
+/accounts - Ver todas tus cuentas
+/account add <nombre> <ENV_PREFIX>
+/account remove <nombre>
+/account enable <nombre>
+/account disable <nombre>
+/account config <nombre> <param> <valor>
+
+Ejemplos:
+/account add Trading3 BINGX3
+/account disable Principal
+/account config Secundaria leverage 15
+"""
+                await event.reply(account_help)
+                return
+
+            subcommand = parts[1].lower()
+
+            if subcommand == "add":
+                if len(parts) < 4:
+                    await event.reply("❌ Uso: /account add <nombre> <ENV_PREFIX>\nEj: /account add MiCuenta BINGX3")
+                    return
+
+                acc_name = parts[2]
+                env_prefix = parts[3].upper()
+
+                # Verificar que existan las credenciales
+                api_key = os.getenv(f"{env_prefix}_API_KEY")
+                api_secret = os.getenv(f"{env_prefix}_SECRET_KEY")
+
+                if not api_key or not api_secret:
+                    await event.reply(
+                        f"❌ No se encontraron credenciales para {env_prefix}\nAsegúrate de tener {env_prefix}_API_KEY y {env_prefix}_SECRET_KEY en .env")
+                    return
+
+                # Añadir cuenta
+                success = bot.config.add_account(user_id, acc_name, env_prefix)
+                if success:
+                    # Crear exchange y añadir al bot
+                    exchange = BingXAPI(api_key, api_secret)
+                    exchange.name = f"BingX-{user_id}-{acc_name}"
+                    exchange.account_name = acc_name
+
+                    if user_id not in bot.user_accounts:
+                        bot.user_accounts[user_id] = {}
+                    bot.user_accounts[user_id][acc_name] = exchange
+
+                    await event.reply(
+                        f"✅ Cuenta '{acc_name}' añadida con {env_prefix}\n\nUsa /accounts para ver tus cuentas")
+                else:
+                    await event.reply(f"❌ Error añadiendo cuenta")
+
+            elif subcommand == "remove":
+                if len(parts) < 3:
+                    await event.reply("❌ Uso: /account remove <nombre>")
+                    return
+
+                acc_name = parts[2]
+                success = bot.config.remove_account(user_id, acc_name)
+                if success:
+                    if user_id in bot.user_accounts and acc_name in bot.user_accounts[user_id]:
+                        del bot.user_accounts[user_id][acc_name]
+                    await event.reply(f"✅ Cuenta '{acc_name}' eliminada")
+                else:
+                    await event.reply(f"❌ Cuenta '{acc_name}' no encontrada")
+
+            elif subcommand in ["enable", "disable"]:
+                if len(parts) < 3:
+                    await event.reply(f"❌ Uso: /account {subcommand} <nombre>")
+                    return
+
+                acc_name = parts[2]
+                enabled = subcommand == "enable"
+                success = bot.config.toggle_account(user_id, acc_name, enabled)
+                if success:
+                    status = "habilitada" if enabled else "deshabilitada"
+                    await event.reply(f"✅ Cuenta '{acc_name}' {status}")
+                else:
+                    await event.reply(f"❌ Cuenta '{acc_name}' no encontrada")
+
+            elif subcommand == "config":
+                if len(parts) < 5:
+                    await event.reply(
+                        "❌ Uso: /account config <cuenta> <param> <valor>\nEj: /account config Principal leverage 15")
+                    return
+
+                acc_name = parts[2]
+                param = parts[3].lower()
+                try:
+                    value = float(parts[4])
+                except ValueError:
+                    await event.reply("❌ El valor debe ser numérico")
+                    return
+
+                param_map = {
+                    "leverage": "default_leverage",
+                    "margin": "usdt_margin_per_trade",
+                    "tp1": "tp1_percent",
+                    "tp2": "tp2_percent",
+                    "tp3": "tp3_percent",
+                    "sl": "default_sl_percent",
+                }
+
+                if param not in param_map:
+                    await event.reply(f"❌ Parámetro '{param}' no válido. Usa: leverage, margin, tp1, tp2, tp3, sl")
+                    return
+
+                config_key = param_map[param]
+                if param == "leverage":
+                    value = int(value)
+
+                success = bot.config.update_account_config(user_id, acc_name, config_key, value)
+                if success:
+                    await event.reply(f"✅ {acc_name}: {param} = {value}")
+                else:
+                    await event.reply(f"❌ Error actualizando configuración")
+
+            else:
+                await event.reply("❌ Subcomando no reconocido. Usa /account para ver opciones")
 
         elif command == "/help":
-            help_text = f"""
-🤖 NeptuneBot
+            # Obtener cuentas del usuario
+            accounts = bot.get_user_all_exchanges(user_id)
+            acc_count = len(accounts)
+            acc_names = ", ".join(accounts.keys()) if accounts else "ninguna"
 
-👤 Tu cuenta: {user_id}
+            help_text = f"""
+🤖 NeptuneBot Multi-Cuenta
+
+👤 Usuario: {user_id}
+📊 Cuentas: {acc_count} ({acc_names})
 {"👑 Admin" if is_admin else ""}
 
 📋 Comandos Básicos:
-/balance - Ver tu balance
-/positions - Ver tus posiciones
-/close SYMBOL - Cerrar posición
-/config - Configuración personal
+/accounts - Ver todas tus cuentas
+/balance [cuenta] - Ver balance
+/positions [cuenta] - Ver posiciones
+/close SYMBOL [cuenta] - Cerrar posición
 /help - Esta ayuda
 
+📊 Gestión de Cuentas:
+/account add <nombre> <PREFIX>
+/account remove <nombre>
+/account enable/disable <nombre>
+/account config <cuenta> <param> <valor>
+
 ⚙️ Configuración:
-/config show - Ver tu config
-/config leverage 15 - Cambiar leverage
-/config margin 10 - Cambiar margen
-/config tp1 2.5 - Cambiar TP1
+/config show [cuenta]
+/config <param> <valor> [cuenta]
 """
             if is_admin:
                 help_text += """
-👑 Comandos de Admin:
-/admin positions - Ver todas
-/admin close USER SYMBOL
-/admin balance USER
-
-
- - Estado del bot
+👑 Admin:
+/admin positions
+/admin status
 """
 
             help_text += """
 📡 Señales Automáticas:
-• BUY BTC - Abre LONG
-• SELL ETH - Abre SHORT
-• CLOSE BTC - Cierra posición
-
-🔍 Monitor: Activo cada 30s
+• BUY BTC - Abre LONG en todas las cuentas
+• SELL ETH - Abre SHORT en todas las cuentas
+• CLOSE BTC - Cierra en todas las cuentas
 """
             await event.reply(help_text)
 

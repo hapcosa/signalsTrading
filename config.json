@@ -20,32 +20,60 @@
       "max_open_positions": 5
     },
     "Obrero": {
-      "usdt_margin_per_trade": 14.0,
-      "default_leverage": 14,
-      "min_balance_required": 50,
-      "tp1_percent": 2.0,
-      "tp2_percent": 3.5,
-      "tp3_percent": 5.0,
-      "tp1_distribution": 15.0,
-      "tp2_distribution": 40.0,
-      "tp3_distribution": 25.0,
-      "default_sl_percent": 2.2,
-      "trailing_stop_activation_percent": 2.8,
-      "trailing_stop_callback": 1.2
+      "accounts": {
+        "Principal": {
+          "env_prefix": "BINGX",
+          "enabled": true,
+          "usdt_margin_per_trade": 14.0,
+          "default_leverage": 14,
+          "min_balance_required": 50,
+          "tp1_percent": 2.0,
+          "tp2_percent": 3.5,
+          "tp3_percent": 5.0,
+          "tp1_distribution": 15.0,
+          "tp2_distribution": 40.0,
+          "tp3_distribution": 25.0,
+          "default_sl_percent": 2.2,
+          "trailing_stop_activation_percent": 2.8,
+          "trailing_stop_callback": 1.2
+        }
+      }
     },
     "Gen Z": {
-      "usdt_margin_per_trade": 15.0,
-      "default_leverage": 14,
-      "min_balance_required": 50,
-      "tp1_percent": 2.0,
-      "tp2_percent": 3.5,
-      "tp3_percent": 5.0,
-      "tp1_distribution": 30,
-      "tp2_distribution": 35,
-      "tp3_distribution": 20,
-      "default_sl_percent": 2.0,
-      "trailing_stop_activation_percent": 2.5,
-      "trailing_stop_callback": 1.2
+      "accounts": {
+        "Principal": {
+          "env_prefix": "BINGX2",
+          "enabled": true,
+          "usdt_margin_per_trade": 15.0,
+          "default_leverage": 14,
+          "min_balance_required": 50,
+          "tp1_percent": 2.0,
+          "tp2_percent": 3.5,
+          "tp3_percent": 5.0,
+          "tp1_distribution": 30,
+          "tp2_distribution": 35,
+          "tp3_distribution": 20,
+          "default_sl_percent": 2.0,
+          "trailing_stop_activation_percent": 2.5,
+          "trailing_stop_callback": 1.2
+        },
+        "Secundaria": {
+          "env_prefix": "BINGX3",
+          "enabled": true,
+          "usdt_margin_per_trade": 15.0,
+          "default_leverage": 14,
+          "min_balance_required": 50,
+          "tp1_percent": 2.0,
+          "tp2_percent": 3.5,
+          "tp3_percent": 5.0,
+          "tp1_distribution": 30,
+          "tp2_distribution": 35,
+          "tp3_distribution": 20,
+          "default_sl_percent": 2.0,
+          "trailing_stop_activation_percent": 2.5,
+          "trailing_stop_callback": 1.0
+        }
+      }
     }
   },
   "notifications": {
